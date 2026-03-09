@@ -70,7 +70,7 @@ def fetch_ohlcv(
         raise ValueError(f"Unsupported timeframe {timeframe!r}. "
                          f"Use one of: {list(TIMEFRAME_MAP.keys())}")
 
-    key = api_key or os.getenv("POLYGON_API_KEY")
+    key = api_key or os.getenv("POLYGON_API_KEY") or os.getenv("MASSIVE_API_KEY")
     if not key:
         raise ValueError("POLYGON_API_KEY not set. "
                          "Set the environment variable or pass api_key=.")
