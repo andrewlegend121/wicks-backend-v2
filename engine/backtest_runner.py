@@ -59,6 +59,11 @@ from trend_detector import detect_trend
 from bos_choch_detector import detect_bos_choch
 from fvg_detector import detect_fvgs
 from ob_detector import detect_obs
+from breaker_detector import detect_breakers
+from propulsion_detector import detect_propulsions
+from rejection_detector import detect_rejections
+from ifvg_detector import detect_ifvgs
+from liquidity_detector import detect_sweeps
 from confluence_scorer import score_bar, CONFLUENCE_REGISTRY
 
 
@@ -335,6 +340,20 @@ def run_backtest(
     obs          = detect_obs(opens, highs, lows, closes, timestamps,
                                swings_roll, method="rolling", length=rolling_length)
 
+    # Layer 4 detectors (run only if needed based on selected confluences)
+    breakers    = detect_breakers(highs, lows, closes, timestamps, obs) \
+                  if "bb" in selected_confluences else []
+    propulsions = detect_propulsions(opens, highs, lows, closes, timestamps, obs) \
+                  if "pb" in selected_confluences else []
+    rejections  = detect_rejections(opens, highs, lows, closes, timestamps,
+                                    swings_roll) \
+                  if "rb" in selected_confluences else []
+    ifvgs       = detect_ifvgs(highs, lows, closes, timestamps, fvgs) \
+                  if "ifvg" in selected_confluences else []
+    sweeps      = detect_sweeps(opens, highs, lows, closes, timestamps,
+                                swings_roll) \
+                  if "sweep" in selected_confluences else []
+
     # ── Step 2: Scan bars for entries ────────────────────────────────────
     trades:       List[Trade] = []
     open_trades:  List[Trade] = []
@@ -418,6 +437,11 @@ def run_backtest(
                 bos_events     = bos_events,
                 fvgs           = fvgs,
                 obs            = obs,
+                breakers       = breakers   if breakers   else None,
+                propulsions    = propulsions if propulsions else None,
+                rejections     = rejections  if rejections  else None,
+                ifvgs          = ifvgs       if ifvgs       else None,
+                sweeps         = sweeps      if sweeps      else None,
                 lookback       = lookback,
                 zone_tolerance = zone_tolerance,
             )
@@ -487,6 +511,11 @@ def run_backtest(
         "fvgs_mitigated":       len([f for f in fvgs if f.status == "MITIGATED"]),
         "obs_total":            len(obs),
         "obs_mitigated":        len([ob for ob in obs if ob.status == "MITIGATED"]),
+        "breakers_total":       len(breakers),
+        "propulsions_total":    len(propulsions),
+        "rejections_total":     len(rejections),
+        "ifvgs_total":          len(ifvgs),
+        "sweeps_total":         len(sweeps),
     }
 
     config = {

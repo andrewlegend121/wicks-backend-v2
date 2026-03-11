@@ -62,6 +62,11 @@ from trend_detector import TrendState
 from bos_choch_detector import BosChochEvent
 from fvg_detector import FVG
 from ob_detector import OrderBlock
+from breaker_detector import BreakerBlock, get_active_breakers_at_bar
+from propulsion_detector import PropulsionBlock, get_active_propulsions_at_bar
+from rejection_detector import RejectionBlock, get_active_rejections_at_bar
+from ifvg_detector import InversionFVG, get_active_ifvgs_at_bar
+from liquidity_detector import LiquiditySweep, get_sweeps_at_bar
 
 
 # ---------------------------------------------------------------------------
@@ -240,10 +245,15 @@ CONFLUENCE_REGISTRY = {
     "fvg":     "Fair Value Gap",
     "ob":      "Order Block",
     "fvg_ob":  "FVG + OB Overlap",
+    "bb":      "Breaker Block",
+    "pb":      "Propulsion Block",
+    "rb":      "Rejection Block",
+    "ifvg":    "Inversion FVG",
+    "sweep":   "Liquidity Sweep",
 }
 
 # Items that contribute to entry zone (not scoring items)
-ZONE_ITEMS = {"fvg", "ob", "fvg_ob"}
+ZONE_ITEMS = {"fvg", "ob", "fvg_ob", "bb", "pb", "rb", "ifvg"}
 
 
 def score_bar(
@@ -256,6 +266,11 @@ def score_bar(
     bos_events:   Optional[List[BosChochEvent]]   = None,
     fvgs:         Optional[List[FVG]]             = None,
     obs:          Optional[List[OrderBlock]]       = None,
+    breakers:     Optional[List[BreakerBlock]]     = None,
+    propulsions:  Optional[List[PropulsionBlock]]  = None,
+    rejections:   Optional[List[RejectionBlock]]   = None,
+    ifvgs:        Optional[List[InversionFVG]]     = None,
+    sweeps:       Optional[List[LiquiditySweep]]   = None,
     lookback:     int                    = 20,
     zone_tolerance: float                = 0.001,
 ) -> ConfluenceResult:
@@ -358,6 +373,96 @@ def score_bar(
         if passed:
             score += 2   # premium confluence — counts double
 
+    # ── New detectors (Layer 4) ──────────────────────────────────────────
+
+    bb_zone: Optional[Tuple[float, float]] = None
+    if "bb" in selected:
+        if breakers is None:
+            items["bb"] = False
+            notes.append("BB: no breakers provided")
+        else:
+            active_bbs = get_active_breakers_at_bar(breakers, bar_index, direction)
+            in_zone = [b for b in active_bbs
+                       if _price_in_zone(price, b.top, b.bottom, zone_tolerance)]
+            passed = len(in_zone) > 0
+            items["bb"] = passed
+            if passed:
+                score += 1
+                bb_zone = (in_zone[0].top, in_zone[0].bottom)
+                notes.append(f"BB: price in {direction} breaker [{in_zone[0].bottom:.5f}-{in_zone[0].top:.5f}]")
+            else:
+                notes.append("BB: no active breaker in zone")
+
+    pb_zone: Optional[Tuple[float, float]] = None
+    if "pb" in selected:
+        if propulsions is None:
+            items["pb"] = False
+            notes.append("PB: no propulsions provided")
+        else:
+            active_pbs = get_active_propulsions_at_bar(propulsions, bar_index, direction)
+            in_zone = [p for p in active_pbs
+                       if _price_in_zone(price, p.top, p.bottom, zone_tolerance)]
+            passed = len(in_zone) > 0
+            items["pb"] = passed
+            if passed:
+                score += 1
+                pb_zone = (in_zone[0].top, in_zone[0].bottom)
+                notes.append(f"PB: price in {direction} propulsion [{in_zone[0].bottom:.5f}-{in_zone[0].top:.5f}]")
+            else:
+                notes.append("PB: no active propulsion in zone")
+
+    rb_zone: Optional[Tuple[float, float]] = None
+    if "rb" in selected:
+        if rejections is None:
+            items["rb"] = False
+            notes.append("RB: no rejections provided")
+        else:
+            active_rbs = get_active_rejections_at_bar(rejections, bar_index, direction)
+            in_zone = [r for r in active_rbs
+                       if _price_in_zone(price, r.top, r.bottom, zone_tolerance)]
+            passed = len(in_zone) > 0
+            items["rb"] = passed
+            if passed:
+                score += 1
+                rb_zone = (in_zone[0].top, in_zone[0].bottom)
+                notes.append(f"RB: price in {direction} rejection [{in_zone[0].bottom:.5f}-{in_zone[0].top:.5f}]")
+            else:
+                notes.append("RB: no active rejection in zone")
+
+    ifvg_zone: Optional[Tuple[float, float]] = None
+    if "ifvg" in selected:
+        if ifvgs is None:
+            items["ifvg"] = False
+            notes.append("IFVG: no ifvgs provided")
+        else:
+            active_ifvgs = get_active_ifvgs_at_bar(ifvgs, bar_index, direction)
+            in_zone = [f for f in active_ifvgs
+                       if _price_in_zone(price, f.top, f.bottom, zone_tolerance)]
+            passed = len(in_zone) > 0
+            items["ifvg"] = passed
+            if passed:
+                score += 1
+                ifvg_zone = (in_zone[0].top, in_zone[0].bottom)
+                notes.append(f"IFVG: price in {direction} inversion FVG [{in_zone[0].bottom:.5f}-{in_zone[0].top:.5f}]")
+            else:
+                notes.append("IFVG: no active inversion FVG in zone")
+
+    if "sweep" in selected:
+        if sweeps is None:
+            items["sweep"] = False
+            notes.append("Sweep: no sweeps provided")
+        else:
+            recent_sweeps = get_sweeps_at_bar(sweeps, bar_index,
+                                              lookback=lookback,
+                                              direction=direction)
+            passed = len(recent_sweeps) > 0
+            items["sweep"] = passed
+            if passed:
+                score += 1
+                notes.append(f"Sweep: {direction} liquidity sweep {bar_index - recent_sweeps[-1].bar_index} bars ago")
+            else:
+                notes.append("Sweep: no recent liquidity sweep")
+
     # ── Determine best entry zone ────────────────────────────────────────
 
     entry_zone: Optional[Tuple[float, float]] = None
@@ -373,6 +478,18 @@ def score_bar(
     elif items.get("fvg"):
         entry_zone = fvg_zone
         entry_type = "FVG"
+    elif items.get("bb") and bb_zone:
+        entry_zone = bb_zone
+        entry_type = "BB"
+    elif items.get("ifvg") and ifvg_zone:
+        entry_zone = ifvg_zone
+        entry_type = "IFVG"
+    elif items.get("pb") and pb_zone:
+        entry_zone = pb_zone
+        entry_type = "PB"
+    elif items.get("rb") and rb_zone:
+        entry_zone = rb_zone
+        entry_type = "RB"
 
     # ── Max score calculation ────────────────────────────────────────────
     max_score = 0
