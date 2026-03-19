@@ -1,638 +1,356 @@
 """
 confluence_scorer.py
-====================
-Wicks SMC Backtesting Engine — Layer 6
+────────────────────
+Aggregates all SMC detector signals into a per-candle confluence score.
 
-Evaluates how many of the user's selected confluence conditions align
-at a specific bar, and returns a score + breakdown.
+Each selected confluence is evaluated at the timestamp of a potential entry.
+The scorer returns a list of ConfluentSetup objects — each representing a
+moment in time where the requested confluence conditions aligned.
 
-A trade is triggered when:
-  1. The score meets or exceeds the user's required minimum (default: 2)
-  2. The trend filter passes (if enabled)
-  3. A valid entry zone exists (OB or FVG that price is touching)
-
-Confluence items supported (Phase 1 — Layers 2-3):
-  - trend       : HTF trend matches trade direction
-  - bos         : recent BOS in trade direction
-  - choch       : recent CHoCH in trade direction (reversal mode)
-  - fvg         : active untouched/partial FVG in trade direction at current price
-  - ob          : active OB in trade direction at current price
-  - fvg_ob      : price inside BOTH an FVG and an OB simultaneously (premium confluence)
-
-Each item scores 1 point. fvg_ob scores 2 (counts as both).
-
-Output
-------
-  ConfluenceResult dataclass:
-    score        int
-    max_score    int   — total possible from selected items
-    passed       bool  — score >= min_required
-    direction    str   — "BULLISH" or "BEARISH"
-    items        dict  — {confluence_id: bool} for each selected item
-    entry_zone   tuple — (top, bottom) of the best entry zone, or None
-    entry_type   str   — "OB", "FVG", "OB+FVG", or None
-    notes        list  — human-readable explanation strings
-
-Usage
------
-  from confluence_scorer import score_bar, ConfluenceResult
-
-  result = score_bar(
-      bar_index   = 150,
-      price       = 1.2345,
-      direction   = "BULLISH",
-      selected    = ["trend", "bos", "fvg", "ob"],
-      min_required= 2,
-      trend_states= trend_states,
-      bos_events  = bos_events,
-      fvgs        = fvgs,
-      obs         = obs,
-      lookback    = 20,   # bars to look back for recent BOS/CHoCH
-  )
-  if result.passed:
-      entry_top, entry_bot = result.entry_zone
+Confluence IDs supported:
+  Structure:  trend | bos | choch | ftd
+  Blocks:     ob | bb | pb | rb
+  Liquidity:  sweep | engineered
+  FVGs:       fvg | ifvg
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional
+import pandas as pd
+import numpy as np
 
-from trend_detector import TrendState
-from bos_choch_detector import BosChochEvent
-from fvg_detector import FVG
-from ob_detector import OrderBlock
-from breaker_detector import BreakerBlock, get_active_breakers_at_bar
-from propulsion_detector import PropulsionBlock, get_active_propulsions_at_bar
-from rejection_detector import RejectionBlock, get_active_rejections_at_bar
-from ifvg_detector import InversionFVG, get_active_ifvgs_at_bar
-from liquidity_detector import LiquiditySweep, get_sweeps_at_bar
+# Detector imports
+from trend_detector      import detect_trend,           TrendTF
+from structure_detector  import detect_bos, detect_choch, detect_ftd
+from order_block_detector import detect_order_blocks
+from blocks_detector     import (detect_breaker_blocks,
+                                  detect_propulsion_blocks,
+                                  detect_rejection_blocks)
+from liquidity_detector  import (detect_liquidity_sweeps,
+                                  detect_engineered_liquidity)
+from fvg_detector        import detect_fvg, detect_ifvg
 
 
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
+# ── data model ────────────────────────────────────────────────────────────────
 
 @dataclass
-class ConfluenceResult:
-    score:       int
-    max_score:   int
-    passed:      bool
-    direction:   str                        # "BULLISH" or "BEARISH"
-    items:       Dict[str, bool]            # {confluence_id: passed}
-    entry_zone:  Optional[Tuple[float, float]]  # (top, bottom)
-    entry_type:  Optional[str]              # "OB", "FVG", "OB+FVG"
-    notes:       List[str] = field(default_factory=list)
-
-    @property
-    def score_pct(self) -> float:
-        return (self.score / self.max_score * 100) if self.max_score > 0 else 0.0
-
-    def __repr__(self):
-        return (f"ConfluenceResult(score={self.score}/{self.max_score} "
-                f"passed={self.passed} dir={self.direction} "
-                f"entry={self.entry_type})")
+class ConfluentSetup:
+    timestamp: pd.Timestamp
+    direction: Literal["bullish", "bearish"]
+    confluences_hit: List[str]          # list of confluence IDs that fired
+    confluence_count: int
+    confluence_score: float             # 0–1 weighted score
+    entry_price: float
+    details: Dict[str, Any] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Zone proximity helper
-# ---------------------------------------------------------------------------
+# ── weighting (each confluence contributes to score) ─────────────────────────
 
-def _price_in_zone(price: float, top: float, bottom: float,
-                   tolerance_pct: float = 0.001) -> bool:
+WEIGHTS: Dict[str, float] = {
+    "trend":      0.15,
+    "bos":        0.12,
+    "choch":      0.12,
+    "ftd":        0.08,
+    "ob":         0.14,
+    "bb":         0.10,
+    "pb":         0.08,
+    "rb":         0.05,
+    "sweep":      0.06,
+    "engineered": 0.05,
+    "fvg":        0.10,
+    "ifvg":       0.08,
+}
+MAX_POSSIBLE = sum(WEIGHTS.values())
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _signals_in_window(
+    signal_list,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    direction_attr: str = "direction",
+    direction_val: Optional[str] = None,
+) -> list:
+    out = []
+    for s in signal_list:
+        ts = getattr(s, "timestamp", None)
+        if ts is None:
+            continue
+        if window_start <= ts <= window_end:
+            if direction_val is None:
+                out.append(s)
+            else:
+                dv = getattr(s, direction_attr, None)
+                if dv is None or dv == direction_val:
+                    out.append(s)
+    return out
+
+
+def _build_all_signals(df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, list]:
     """
-    True if price is within or very near the zone [bottom, top].
-    tolerance_pct: allow price to be this % above/below zone edges.
-    Default 0.1% — catches price approaching zone without requiring exact touch.
+    Run every enabled detector and return a dict of signal lists.
+    params keys match confluence IDs.
     """
-    tol = (top - bottom) * tolerance_pct + (top * 0.0001)
-    return (bottom - tol) <= price <= (top + tol)
+    signals: Dict[str, list] = {}
+
+    if "trend" in params:
+        p = params["trend"]
+        signals["trend"] = detect_trend(
+            df,
+            timeframe     = p.get("Timeframe", "4H"),
+            bias_filter   = p.get("Bias", "Both"),
+        )
+
+    if "bos" in params:
+        p = params["bos"]
+        signals["bos"] = detect_bos(
+            df,
+            timeframe  = p.get("TF", "1H"),
+            direction  = p.get("Direction", "Both"),
+        )
+
+    if "choch" in params:
+        p = params["choch"]
+        signals["choch"] = detect_choch(
+            df,
+            timeframe  = p.get("TF", "15m"),
+            direction  = p.get("Direction", "Both"),
+        )
+
+    if "ftd" in params:
+        p = params["ftd"]
+        signals["ftd"] = detect_ftd(
+            df,
+            timeframe   = p.get("TF", "15m"),
+            level_type  = p.get("Level", "High"),
+            direction   = p.get("Direction", "Both"),
+        )
+
+    if "ob" in params:
+        p = params["ob"]
+        signals["ob"] = detect_order_blocks(
+            df,
+            timeframe      = p.get("TF", "1H"),
+            ob_type        = p.get("Type", "Both"),
+            mitigation     = p.get("Mitigation", "Wick"),
+            volume_filter  = p.get("Volume", "Any"),
+        )
+
+    if "bb" in params:
+        p = params["bb"]
+        signals["bb"] = detect_breaker_blocks(
+            df,
+            timeframe   = p.get("TF", "1H"),
+            bb_type     = p.get("Type", "Both"),
+            mitigation  = p.get("Mitigation", "Wick"),
+        )
+
+    if "pb" in params:
+        p = params["pb"]
+        signals["pb"] = detect_propulsion_blocks(
+            df,
+            timeframe = p.get("TF", "1H"),
+            pb_type   = p.get("Direction", "Both"),
+        )
+
+    if "rb" in params:
+        p = params["rb"]
+        signals["rb"] = detect_rejection_blocks(
+            df,
+            timeframe  = p.get("TF", "15m"),
+            min_wicks  = p.get("Min wicks", "3"),
+        )
+
+    if "sweep" in params:
+        p = params["sweep"]
+        signals["sweep"] = detect_liquidity_sweeps(
+            df,
+            timeframe   = p.get("TF", "1H"),
+            sweep_type  = p.get("Target", "Both"),
+        )
+
+    if "engineered" in params:
+        p = params["engineered"]
+        signals["engineered"] = detect_engineered_liquidity(
+            df,
+            timeframe = p.get("TF", "1H"),
+            eng_type  = p.get("Type", "Inducement"),
+        )
+
+    if "fvg" in params:
+        p = params["fvg"]
+        signals["fvg"] = detect_fvg(
+            df,
+            timeframe      = p.get("TF", "15m"),
+            fvg_type       = p.get("Type", "Both"),
+            status_filter  = p.get("Status", "Any"),
+            ce_filter      = p.get("CE (50%)", "Any"),
+        )
+
+    if "ifvg" in params:
+        p = params["ifvg"]
+        signals["ifvg"] = detect_ifvg(
+            df,
+            timeframe      = p.get("TF", "15m"),
+            ifvg_type      = p.get("Type", "Both"),
+            status_filter  = p.get("Status", "Any"),
+            ce_filter      = p.get("CE (50%)", "Any"),
+        )
+
+    return signals
 
 
-def _zone_overlap(top1, bot1, top2, bot2) -> Optional[Tuple[float, float]]:
-    """Return overlap zone (top, bottom) of two zones, or None if no overlap."""
-    overlap_top = min(top1, top2)
-    overlap_bot = max(bot1, bot2)
-    if overlap_top > overlap_bot:
-        return (overlap_top, overlap_bot)
+# ── DIRECTION RESOLVER ────────────────────────────────────────────────────────
+
+def _get_direction(signal_id: str, sig) -> Optional[str]:
+    """Extract normalised direction string from any signal type."""
+    for attr in ("direction", "bias", "ob_type", "bb_type", "pb_type",
+                 "rb_type", "sweep_type", "eng_type", "fvg_type", "ifvg_type"):
+        val = getattr(sig, attr, None)
+        if val is None:
+            continue
+        if "bull" in str(val).lower() or "buy" in str(val).lower():
+            return "bullish"
+        if "bear" in str(val).lower() or "sell" in str(val).lower():
+            return "bearish"
     return None
 
 
-# ---------------------------------------------------------------------------
-# Individual confluence checks
-# ---------------------------------------------------------------------------
+# ── MAIN SCORER ───────────────────────────────────────────────────────────────
 
-def _check_trend(
-    bar_index:    int,
-    direction:    str,
-    trend_states: List[TrendState],
-) -> Tuple[bool, str]:
-    if bar_index >= len(trend_states):
-        return False, "Trend: no data"
-    state = trend_states[bar_index]
-    passed = state.trend == direction
-    return passed, f"Trend: {state.trend} ({'✓' if passed else '✗'} need {direction})"
-
-
-def _check_bos(
-    bar_index:  int,
-    direction:  str,
-    bos_events: List[BosChochEvent],
-    lookback:   int = 20,
-) -> Tuple[bool, str]:
-    recent = [
-        e for e in bos_events
-        if e.event_type == "BOS"
-        and e.direction == direction
-        and (bar_index - lookback) <= e.bar_index <= bar_index
-    ]
-    passed = len(recent) > 0
-    note = f"BOS ({direction}): {'found at bar ' + str(recent[-1].bar_index) if passed else 'none in last ' + str(lookback) + ' bars'}"
-    return passed, note
-
-
-def _check_choch(
-    bar_index:  int,
-    direction:  str,
-    bos_events: List[BosChochEvent],
-    lookback:   int = 20,
-) -> Tuple[bool, str]:
-    recent = [
-        e for e in bos_events
-        if e.event_type == "CHoCH"
-        and e.direction == direction
-        and (bar_index - lookback) <= e.bar_index <= bar_index
-    ]
-    passed = len(recent) > 0
-    note = f"CHoCH ({direction}): {'found at bar ' + str(recent[-1].bar_index) if passed else 'none in last ' + str(lookback) + ' bars'}"
-    return passed, note
-
-
-def _check_fvg(
-    bar_index: int,
-    price:     float,
-    direction: str,
-    fvgs:      List[FVG],
-    tolerance: float = 0.001,
-) -> Tuple[bool, str, Optional[Tuple[float, float]]]:
-    """Returns (passed, note, zone) — zone is (top, bottom) or None."""
-    active = [
-        f for f in fvgs
-        if f.bar_index <= bar_index
-        and f.direction == direction
-        and f.is_active
-        and (f.mitigated_bar is None or f.mitigated_bar > bar_index)
-    ]
-    # Find FVGs where price is at or inside the zone
-    touching = [
-        f for f in active
-        if _price_in_zone(price, f.top, f.bottom, tolerance)
-    ]
-    if touching:
-        # Use the most recently formed one
-        best = max(touching, key=lambda f: f.bar_index)
-        return True, f"FVG ({direction}): price in zone [{best.bottom:.5f}-{best.top:.5f}]", (best.top, best.bottom)
-    return False, f"FVG ({direction}): no active zone at price {price:.5f}", None
-
-
-def _check_ob(
-    bar_index: int,
-    price:     float,
-    direction: str,
-    obs:       List[OrderBlock],
-    tolerance: float = 0.001,
-) -> Tuple[bool, str, Optional[Tuple[float, float]]]:
-    """Returns (passed, note, zone)."""
-    active = [
-        ob for ob in obs
-        if ob.bar_index <= bar_index
-        and ob.direction == direction
-        and ob.is_active
-        and (ob.mitigated_bar is None or ob.mitigated_bar > bar_index)
-    ]
-    touching = [
-        ob for ob in active
-        if _price_in_zone(price, ob.top, ob.bottom, tolerance)
-    ]
-    if touching:
-        best = max(touching, key=lambda ob: ob.bar_index)
-        return True, f"OB ({direction}): price in zone [{best.bottom:.5f}-{best.top:.5f}]", (best.top, best.bottom)
-    return False, f"OB ({direction}): no active zone at price {price:.5f}", None
-
-
-def _check_fvg_ob_overlap(
-    fvg_zone: Optional[Tuple[float, float]],
-    ob_zone:  Optional[Tuple[float, float]],
-) -> Tuple[bool, str, Optional[Tuple[float, float]]]:
-    """Check if both FVG and OB are active and overlapping (premium confluence)."""
-    if fvg_zone is None or ob_zone is None:
-        return False, "FVG+OB overlap: one or both zones missing", None
-    overlap = _zone_overlap(fvg_zone[0], fvg_zone[1], ob_zone[0], ob_zone[1])
-    if overlap:
-        return True, f"FVG+OB overlap: [{overlap[1]:.5f}-{overlap[0]:.5f}]", overlap
-    return False, "FVG+OB overlap: zones don't overlap", None
-
-
-# ---------------------------------------------------------------------------
-# Main scorer
-# ---------------------------------------------------------------------------
-
-# All supported confluence IDs and their display labels
-CONFLUENCE_REGISTRY = {
-    "trend":   "Trend Alignment",
-    "bos":     "Break of Structure",
-    "choch":   "Change of Character",
-    "fvg":     "Fair Value Gap",
-    "ob":      "Order Block",
-    "fvg_ob":  "FVG + OB Overlap",
-    "bb":      "Breaker Block",
-    "pb":      "Propulsion Block",
-    "rb":      "Rejection Block",
-    "ifvg":    "Inversion FVG",
-    "sweep":   "Liquidity Sweep",
-}
-
-# Items that contribute to entry zone (not scoring items)
-ZONE_ITEMS = {"fvg", "ob", "fvg_ob", "bb", "pb", "rb", "ifvg"}
-
-
-def score_bar(
-    bar_index:    int,
-    price:        float,
-    direction:    str,
-    selected:     List[str],
-    min_required: int                    = 2,
-    trend_states: Optional[List[TrendState]]      = None,
-    bos_events:   Optional[List[BosChochEvent]]   = None,
-    fvgs:         Optional[List[FVG]]             = None,
-    obs:          Optional[List[OrderBlock]]       = None,
-    breakers:     Optional[List[BreakerBlock]]     = None,
-    propulsions:  Optional[List[PropulsionBlock]]  = None,
-    rejections:   Optional[List[RejectionBlock]]   = None,
-    ifvgs:        Optional[List[InversionFVG]]     = None,
-    sweeps:       Optional[List[LiquiditySweep]]   = None,
-    lookback:     int                    = 20,
-    zone_tolerance: float                = 0.001,
-) -> ConfluenceResult:
+def score_confluences(
+    df: pd.DataFrame,
+    params: Dict[str, Dict[str, Any]],
+    min_confluences: int = 2,
+    lookback_bars: int = 5,      # candles to look back for signal alignment
+    entry_timeframe: str = "15m",
+) -> List[ConfluentSetup]:
     """
-    Score a single bar against the user's selected confluence conditions.
+    Build and score all confluence setups.
 
-    Parameters
-    ----------
-    bar_index    : current bar being evaluated
-    price        : current close price (used for zone proximity checks)
-    direction    : "BULLISH" or "BEARISH" — direction of the proposed trade
-    selected     : list of confluence IDs the user has toggled ON
-                   e.g. ["trend", "bos", "fvg", "ob"]
-    min_required : minimum score to consider the bar a valid setup
-    trend_states : from trend_detector.detect_trend()
-    bos_events   : from bos_choch_detector.detect_bos_choch()
-    fvgs         : from fvg_detector.detect_fvgs()
-    obs          : from ob_detector.detect_obs()
-    lookback     : bars to look back for recent BOS/CHoCH events
-    zone_tolerance: price proximity tolerance for zone checks (0.001 = 0.1%)
+    params  — dict of {confluence_id: {param_key: value}}
+               Only IDs present in dict are evaluated.
 
-    Returns
-    -------
-    ConfluenceResult
+    Returns list of ConfluentSetup sorted by timestamp.
     """
-    if direction not in ("BULLISH", "BEARISH"):
-        raise ValueError(f"direction must be 'BULLISH' or 'BEARISH', got {direction!r}")
+    if not params:
+        return []
 
-    items:  Dict[str, bool] = {}
-    notes:  List[str]       = []
-    score   = 0
-    fvg_zone: Optional[Tuple[float, float]] = None
-    ob_zone:  Optional[Tuple[float, float]] = None
+    # Run all detectors
+    all_signals = _build_all_signals(df, params)
 
-    # ── Evaluate each selected confluence ───────────────────────────────
-
-    if "trend" in selected:
-        if trend_states is None:
-            items["trend"] = False
-            notes.append("Trend: no trend_states provided")
-        else:
-            passed, note = _check_trend(bar_index, direction, trend_states)
-            items["trend"] = passed
-            notes.append(note)
-            if passed:
-                score += 1
-
-    if "bos" in selected:
-        if bos_events is None:
-            items["bos"] = False
-            notes.append("BOS: no bos_events provided")
-        else:
-            passed, note = _check_bos(bar_index, direction, bos_events, lookback)
-            items["bos"] = passed
-            notes.append(note)
-            if passed:
-                score += 1
-
-    if "choch" in selected:
-        if bos_events is None:
-            items["choch"] = False
-            notes.append("CHoCH: no bos_events provided")
-        else:
-            passed, note = _check_choch(bar_index, direction, bos_events, lookback)
-            items["choch"] = passed
-            notes.append(note)
-            if passed:
-                score += 1
-
-    if "fvg" in selected:
-        if fvgs is None:
-            items["fvg"] = False
-            notes.append("FVG: no fvgs provided")
-            fvg_zone = None
-        else:
-            passed, note, fvg_zone = _check_fvg(
-                bar_index, price, direction, fvgs, zone_tolerance)
-            items["fvg"] = passed
-            notes.append(note)
-            if passed:
-                score += 1
-
-    if "ob" in selected:
-        if obs is None:
-            items["ob"] = False
-            notes.append("OB: no obs provided")
-            ob_zone = None
-        else:
-            passed, note, ob_zone = _check_ob(
-                bar_index, price, direction, obs, zone_tolerance)
-            items["ob"] = passed
-            notes.append(note)
-            if passed:
-                score += 1
-
-    if "fvg_ob" in selected:
-        passed, note, overlap_zone = _check_fvg_ob_overlap(fvg_zone, ob_zone)
-        items["fvg_ob"] = passed
-        notes.append(note)
-        if passed:
-            score += 2   # premium confluence — counts double
-
-    # ── New detectors (Layer 4) ──────────────────────────────────────────
-
-    bb_zone: Optional[Tuple[float, float]] = None
-    if "bb" in selected:
-        if breakers is None:
-            items["bb"] = False
-            notes.append("BB: no breakers provided")
-        else:
-            active_bbs = get_active_breakers_at_bar(breakers, bar_index, direction)
-            in_zone = [b for b in active_bbs
-                       if _price_in_zone(price, b.top, b.bottom, zone_tolerance)]
-            passed = len(in_zone) > 0
-            items["bb"] = passed
-            if passed:
-                score += 1
-                bb_zone = (in_zone[0].top, in_zone[0].bottom)
-                notes.append(f"BB: price in {direction} breaker [{in_zone[0].bottom:.5f}-{in_zone[0].top:.5f}]")
-            else:
-                notes.append("BB: no active breaker in zone")
-
-    pb_zone: Optional[Tuple[float, float]] = None
-    if "pb" in selected:
-        if propulsions is None:
-            items["pb"] = False
-            notes.append("PB: no propulsions provided")
-        else:
-            active_pbs = get_active_propulsions_at_bar(propulsions, bar_index, direction)
-            in_zone = [p for p in active_pbs
-                       if _price_in_zone(price, p.top, p.bottom, zone_tolerance)]
-            passed = len(in_zone) > 0
-            items["pb"] = passed
-            if passed:
-                score += 1
-                pb_zone = (in_zone[0].top, in_zone[0].bottom)
-                notes.append(f"PB: price in {direction} propulsion [{in_zone[0].bottom:.5f}-{in_zone[0].top:.5f}]")
-            else:
-                notes.append("PB: no active propulsion in zone")
-
-    rb_zone: Optional[Tuple[float, float]] = None
-    if "rb" in selected:
-        if rejections is None:
-            items["rb"] = False
-            notes.append("RB: no rejections provided")
-        else:
-            active_rbs = get_active_rejections_at_bar(rejections, bar_index, direction)
-            in_zone = [r for r in active_rbs
-                       if _price_in_zone(price, r.top, r.bottom, zone_tolerance)]
-            passed = len(in_zone) > 0
-            items["rb"] = passed
-            if passed:
-                score += 1
-                rb_zone = (in_zone[0].top, in_zone[0].bottom)
-                notes.append(f"RB: price in {direction} rejection [{in_zone[0].bottom:.5f}-{in_zone[0].top:.5f}]")
-            else:
-                notes.append("RB: no active rejection in zone")
-
-    ifvg_zone: Optional[Tuple[float, float]] = None
-    if "ifvg" in selected:
-        if ifvgs is None:
-            items["ifvg"] = False
-            notes.append("IFVG: no ifvgs provided")
-        else:
-            active_ifvgs = get_active_ifvgs_at_bar(ifvgs, bar_index, direction)
-            in_zone = [f for f in active_ifvgs
-                       if _price_in_zone(price, f.top, f.bottom, zone_tolerance)]
-            passed = len(in_zone) > 0
-            items["ifvg"] = passed
-            if passed:
-                score += 1
-                ifvg_zone = (in_zone[0].top, in_zone[0].bottom)
-                notes.append(f"IFVG: price in {direction} inversion FVG [{in_zone[0].bottom:.5f}-{in_zone[0].top:.5f}]")
-            else:
-                notes.append("IFVG: no active inversion FVG in zone")
-
-    if "sweep" in selected:
-        if sweeps is None:
-            items["sweep"] = False
-            notes.append("Sweep: no sweeps provided")
-        else:
-            recent_sweeps = get_sweeps_at_bar(sweeps, bar_index,
-                                              lookback=lookback,
-                                              direction=direction)
-            passed = len(recent_sweeps) > 0
-            items["sweep"] = passed
-            if passed:
-                score += 1
-                notes.append(f"Sweep: {direction} liquidity sweep {bar_index - recent_sweeps[-1].bar_index} bars ago")
-            else:
-                notes.append("Sweep: no recent liquidity sweep")
-
-    # ── Determine best entry zone ────────────────────────────────────────
-
-    entry_zone: Optional[Tuple[float, float]] = None
-    entry_type: Optional[str] = None
-
-    if items.get("fvg_ob"):
-        _, _, overlap = _check_fvg_ob_overlap(fvg_zone, ob_zone)
-        entry_zone = overlap
-        entry_type = "OB+FVG"
-    elif items.get("ob"):
-        entry_zone = ob_zone
-        entry_type = "OB"
-    elif items.get("fvg"):
-        entry_zone = fvg_zone
-        entry_type = "FVG"
-    elif items.get("bb") and bb_zone:
-        entry_zone = bb_zone
-        entry_type = "BB"
-    elif items.get("ifvg") and ifvg_zone:
-        entry_zone = ifvg_zone
-        entry_type = "IFVG"
-    elif items.get("pb") and pb_zone:
-        entry_zone = pb_zone
-        entry_type = "PB"
-    elif items.get("rb") and rb_zone:
-        entry_zone = rb_zone
-        entry_type = "RB"
-
-    # ── Max score calculation ────────────────────────────────────────────
-    max_score = 0
-    for item_id in selected:
-        if item_id in CONFLUENCE_REGISTRY:
-            max_score += 2 if item_id == "fvg_ob" else 1
-
-    passed = score >= min_required
-
-    return ConfluenceResult(
-        score      = score,
-        max_score  = max_score,
-        passed     = passed,
-        direction  = direction,
-        items      = items,
-        entry_zone = entry_zone,
-        entry_type = entry_type,
-        notes      = notes,
+    # Determine entry candles from entry_timeframe
+    rule = {"5m": "5min", "15m": "15min", "1H": "1h", "4H": "4h"}.get(
+        entry_timeframe, "15min"
     )
+    entry_df = df.resample(rule).agg(
+        {"open": "first", "high": "max", "low": "min",
+         "close": "last", "volume": "sum"}
+    ).dropna()
+
+    setups: List[ConfluentSetup] = []
+
+    for i, (ts, candle) in enumerate(entry_df.iterrows()):
+        if i < lookback_bars:
+            continue
+
+        window_start = entry_df.index[i - lookback_bars]
+        window_end   = ts
+
+        # Try both directions
+        for direction in ("bullish", "bearish"):
+            hits:    List[str] = []
+            details: Dict[str, Any] = {}
+
+            for cid, sig_list in all_signals.items():
+                matched = _signals_in_window(
+                    sig_list, window_start, window_end
+                )
+                dir_matched = [s for s in matched
+                               if _get_direction(cid, s) in (direction, None)]
+                if dir_matched:
+                    hits.append(cid)
+                    details[cid] = len(dir_matched)
+
+            if len(hits) < min_confluences:
+                continue
+
+            raw_score = sum(WEIGHTS.get(cid, 0.05) for cid in hits)
+            norm_score = round(min(raw_score / MAX_POSSIBLE, 1.0), 3)
+
+            setups.append(ConfluentSetup(
+                timestamp        = ts,
+                direction        = direction,
+                confluences_hit  = hits,
+                confluence_count = len(hits),
+                confluence_score = norm_score,
+                entry_price      = candle["close"],
+                details          = details,
+            ))
+
+    # Deduplicate: keep highest-score setup per timestamp
+    dedup: Dict[pd.Timestamp, ConfluentSetup] = {}
+    for s in setups:
+        key = (s.timestamp, s.direction)
+        if key not in dedup or s.confluence_score > dedup[key].confluence_score:
+            dedup[key] = s
+
+    return sorted(dedup.values(), key=lambda s: s.timestamp)
 
 
-def score_both_directions(
-    bar_index:    int,
-    price:        float,
-    selected:     List[str],
-    min_required: int = 2,
-    **kwargs,
-) -> Dict[str, ConfluenceResult]:
-    """
-    Score both BULLISH and BEARISH at the same bar.
-    Returns {"BULLISH": result, "BEARISH": result}.
-    Useful for the backtest runner when scanning without a directional bias.
-    """
+# ── convenience: summary stats ────────────────────────────────────────────────
+
+def summarise(setups: List[ConfluentSetup]) -> Dict[str, Any]:
+    if not setups:
+        return {"total": 0}
+    scores = [s.confluence_score for s in setups]
+    dirs   = [s.direction for s in setups]
     return {
-        "BULLISH": score_bar(bar_index, price, "BULLISH", selected, min_required, **kwargs),
-        "BEARISH": score_bar(bar_index, price, "BEARISH", selected, min_required, **kwargs),
+        "total"         : len(setups),
+        "bullish"       : dirs.count("bullish"),
+        "bearish"       : dirs.count("bearish"),
+        "avg_score"     : round(float(np.mean(scores)), 3),
+        "max_score"     : round(float(np.max(scores)), 3),
+        "min_score"     : round(float(np.min(scores)), 3),
+        "high_conf"     : sum(1 for s in scores if s >= 0.5),
+        "confluence_freq": {
+            cid: sum(1 for s in setups if cid in s.confluences_hit)
+            for cid in WEIGHTS
+        },
     }
 
 
-# ---------------------------------------------------------------------------
-# Self-test
-# ---------------------------------------------------------------------------
+# ── self-test ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import math, sys
-    sys.path.insert(0, ".")
-    from swing_detector import detect_swings
-    from trend_detector import detect_trend
-    from bos_choch_detector import detect_bos_choch
-    from fvg_detector import detect_fvgs
-    from ob_detector import detect_obs
+    import random
+    random.seed(77)
+    n   = 5000
+    idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+    close = 1.0800
+    rows  = []
+    for i in range(n):
+        close += random.gauss(0.0001, 0.0009)
+        o = close - abs(random.gauss(0, 0.0003))
+        h = max(o, close) + abs(random.gauss(0, 0.0005))
+        l = min(o, close) - abs(random.gauss(0, 0.0005))
+        rows.append({"open": o, "high": h, "low": l,
+                     "close": close, "volume": random.randint(100, 2000)})
+    df = pd.DataFrame(rows, index=idx)
 
-    print("=" * 60)
-    print("confluence_scorer.py — self test")
-    print("=" * 60)
+    params = {
+        "trend":  {"Bias": "Both",     "Timeframe": "4H"},
+        "bos":    {"Direction": "Both","TF": "1H"},
+        "fvg":    {"Type": "Both",     "TF": "15m",  "Status": "Any", "CE (50%)": "Any"},
+        "ob":     {"Type": "Both",     "TF": "15m",  "Mitigation": "Wick", "Volume": "Any"},
+    }
 
-    N = 150
-    ts_base = 1_700_000_000_000
-
-    def mp(i):
-        if i < 80:
-            return 100 + i * 0.25 + 5 * math.sin(2 * math.pi * i / 18)
-        return 120 - (i - 80) * 0.2 + 5 * math.sin(2 * math.pi * i / 18)
-
-    mid    = [mp(i) for i in range(N)]
-    opens  = [m - 0.15 for m in mid]
-    highs  = [m + 0.9  for m in mid]
-    lows   = [m - 0.9  for m in mid]
-    closes = mid
-    ts_arr = [ts_base + i * 300_000 for i in range(N)]
-
-    swings_piv  = detect_swings(highs, lows, ts_arr, method="pivot",   length=5)
-    swings_roll = detect_swings(highs, lows, ts_arr, method="rolling", length=10)
-    trend_states = detect_trend(swings_piv, ts_arr)
-    bos_events   = detect_bos_choch(highs, lows, closes, ts_arr, swings_piv, trend_states)
-    fvgs         = detect_fvgs(highs, lows, closes, ts_arr)
-    obs          = detect_obs(opens, highs, lows, closes, ts_arr, swings_roll)
-
-    print(f"\nSetup: {len(swings_piv)} pivot swings, {len(bos_events)} BOS/CHoCH events")
-    print(f"       {len(fvgs)} FVGs, {len(obs)} OBs")
-
-    # Test 1: score at bar 70 (should be in uptrend)
-    bar = 70
-    price = closes[bar]
-    result = score_bar(
-        bar_index    = bar,
-        price        = price,
-        direction    = "BULLISH",
-        selected     = ["trend", "bos", "fvg", "ob"],
-        min_required = 2,
-        trend_states = trend_states,
-        bos_events   = bos_events,
-        fvgs         = fvgs,
-        obs          = obs,
-        lookback     = 30,
-        zone_tolerance = 0.05,   # wide tolerance for synthetic data
-    )
-    print(f"\nTest 1 — bar={bar} price={price:.3f} BULLISH:")
-    print(f"  Score: {result.score}/{result.max_score}  passed={result.passed}")
-    for note in result.notes:
-        print(f"  {note}")
-
-    # Test 2: score both directions
-    results = score_both_directions(
-        bar_index    = bar,
-        price        = price,
-        selected     = ["trend", "bos", "fvg"],
-        min_required = 2,
-        trend_states = trend_states,
-        bos_events   = bos_events,
-        fvgs         = fvgs,
-        lookback     = 30,
-        zone_tolerance = 0.05,
-    )
-    print(f"\nTest 2 — score_both_directions at bar {bar}:")
-    for d, r in results.items():
-        print(f"  {d}: {r.score}/{r.max_score} passed={r.passed}")
-
-    # Test 3: missing data gracefully handled
-    result3 = score_bar(
-        bar_index    = 50,
-        price        = 110.0,
-        direction    = "BULLISH",
-        selected     = ["trend", "bos", "fvg", "ob"],
-        min_required = 2,
-        # Deliberately omit all data sources
-    )
-    print(f"\nTest 3 — no data provided: score={result3.score} passed={result3.passed}")
-    assert result3.score == 0
-    assert result3.passed == False
-
-    # Test 4: fvg_ob premium scoring
-    result4 = score_bar(
-        bar_index    = bar,
-        price        = price,
-        direction    = "BULLISH",
-        selected     = ["fvg", "ob", "fvg_ob"],
-        min_required = 2,
-        fvgs         = fvgs,
-        obs          = obs,
-        zone_tolerance = 0.05,
-    )
-    print(f"\nTest 4 — fvg_ob premium: score={result4.score}/{result4.max_score}")
-    assert result4.max_score == 4, f"fvg_ob should give max_score=4, got {result4.max_score}"
-
-    print("\n✅ All tests passed")
+    setups = score_confluences(df, params, min_confluences=2)
+    stats  = summarise(setups)
+    print(f"Setups found: {stats['total']}")
+    print(f"  Bullish   : {stats['bullish']}")
+    print(f"  Bearish   : {stats['bearish']}")
+    print(f"  Avg score : {stats['avg_score']}")
+    print(f"  High conf : {stats['high_conf']}")

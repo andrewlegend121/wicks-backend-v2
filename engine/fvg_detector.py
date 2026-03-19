@@ -1,396 +1,347 @@
 """
 fvg_detector.py
-===============
-Wicks SMC Backtesting Engine — Layer 3
+───────────────
+ICT Fair Value Gap (FVG) and Inverse FVG (IFVG) detection.
 
-Detects Fair Value Gaps (FVGs) from OHLCV data.
+━━ FAIR VALUE GAP ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3-candle pattern with a price imbalance (gap):
 
-Pine Script ground truth: ChartPrime FVG Volume Profile indicator
+  Bullish FVG:
+    candle[1].low > candle[-1].high    (candle[-1] is 2 bars back)
+    i.e.  low of middle candle > high of first candle
+    zone: [candle[-1].high  →  candle[1].low]
 
-Definition
-----------
-A Fair Value Gap is a 3-candle imbalance where there is a price gap
-between candles 0 and 2 that candle 1 (the impulse) does not cover.
+  Bearish FVG:
+    candle[1].high < candle[-1].low
+    zone: [candle[1].high  →  candle[-1].low]
 
-  Bullish FVG:  low[0] > high[2]   — gap above candle 2's high
-                The gap zone: bottom = high[2], top = low[0]
+Status tracking (after formation):
+  Unfilled  — price has not re-entered the FVG zone
+  Partial   — price entered but did not close through the full zone
+  Filled    — price closed fully through the zone
 
-  Bearish FVG:  high[0] < low[2]   — gap below candle 2's low
-                The gap zone: bottom = high[0], top = low[2]
+CE (Consequent Encroachment / 50% level):
+  Respect  — price touched the 50% level but bounced
+  Violate  — price closed beyond the 50% level
+  Any      — no filter
 
-Index convention (Pine Script):
-  [0] = current bar (the bar AFTER the impulse)
-  [1] = impulse bar  (middle candle — typically the largest)
-  [2] = bar before the impulse
+━━ INVERSE FVG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+A FVG that was FULLY filled (price closed through it).
+The zone now acts as a magnet in the OPPOSITE direction.
 
-In Python arrays with oldest-first indexing:
-  Detected at bar i, looking back:
-    candle_0 = bar i      (current)
-    candle_1 = bar i - 1  (impulse)
-    candle_2 = bar i - 2  (pre-impulse)
+  Bullish IFVG — was a bearish FVG; now acts as support.
+  Bearish IFVG — was a bullish FVG; now acts as resistance.
 
-Size filter (ChartPrime uses z-score; Python simplification):
-  gap_size > atr_multiplier * ATR(14)
-  Default: atr_multiplier = 0.0  (accept all gaps, no filter)
-  Recommended production value: 0.1 (10% of ATR)
-
-Invalidation (mitigation):
-  Bullish FVG: price wicks INTO the zone (low <= fvg.top)   → partial fill
-               price closes BELOW fvg.bottom                → fully invalidated
-  Bearish FVG: price wicks INTO the zone (high >= fvg.bottom) → partial fill
-               price closes ABOVE fvg.top                   → fully invalidated
-
-States:
-  "ACTIVE"    — untouched, full zone available
-  "PARTIAL"   — price has entered the zone but not exited the other side
-  "MITIGATED" — price has closed beyond the zone (zone consumed)
-
-Output
-------
-  FVG dataclass:
-    bar_index      int    — bar i where FVG was detected/confirmed
-    timestamp      int
-    direction      str    — "BULLISH" or "BEARISH"
-    top            float  — upper boundary of gap zone
-    bottom         float  — lower boundary of gap zone
-    midline        float  — avg(top, bottom)
-    impulse_bar    int    — bar index of candle_1 (the impulse)
-    gap_size       float  — top - bottom
-    status         str    — "ACTIVE", "PARTIAL", "MITIGATED"
-    mitigated_bar  int | None
-
-Usage
------
-  from fvg_detector import detect_fvgs, get_active_fvgs_at_bar
-
-  fvgs = detect_fvgs(highs, lows, closes, timestamps)
-  active = get_active_fvgs_at_bar(fvgs, bar_index=100)
+Timeframes: 5m | 15m | 1H | 4H
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Literal, List, Optional
+import pandas as pd
+import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# ATR helper (simple, no pandas dependency)
-# ---------------------------------------------------------------------------
-
-def _atr(highs: List[float], lows: List[float], closes: List[float],
-         period: int, idx: int) -> float:
-    """Compute ATR at bar idx using Wilder's smoothing (simplified to SMA here)."""
-    if idx < 1:
-        return highs[idx] - lows[idx]
-    start = max(1, idx - period + 1)
-    trs = []
-    for j in range(start, idx + 1):
-        tr = max(
-            highs[j] - lows[j],
-            abs(highs[j] - closes[j - 1]),
-            abs(lows[j]  - closes[j - 1]),
-        )
-        trs.append(tr)
-    return sum(trs) / len(trs) if trs else (highs[idx] - lows[idx])
+FVGType   = Literal["Bullish", "Bearish", "Both"]
+FVGStatus = Literal["Unfilled", "Partial", "Any"]
+CEFilter  = Literal["Respect", "Violate", "Any"]
+FVGTF     = Literal["5m", "15m", "1H", "4H"]
 
 
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
+# ── data models ───────────────────────────────────────────────────────────────
 
 @dataclass
 class FVG:
-    bar_index:     int         # bar where FVG was confirmed (candle_0 bar)
-    timestamp:     int
-    direction:     str         # "BULLISH" or "BEARISH"
-    top:           float       # upper boundary
-    bottom:        float       # lower boundary
-    midline:       float       # avg(top, bottom)
-    impulse_bar:   int         # bar index of the impulse candle (candle_1)
-    gap_size:      float       # top - bottom
-
-    status:        str         = "ACTIVE"   # "ACTIVE", "PARTIAL", "MITIGATED"
-    mitigated_bar: Optional[int] = None
-    partial_bar:   Optional[int] = None
-
-    # Set after full scan — bar when first touched (for BPR / IFVG derivation)
-    first_touch_bar: Optional[int] = None
-
-    def __repr__(self):
-        return (f"FVG({self.direction} top={self.top:.5f} bot={self.bottom:.5f} "
-                f"bar={self.bar_index} status={self.status})")
-
-    @property
-    def is_active(self) -> bool:
-        return self.status in ("ACTIVE", "PARTIAL")
-
-    @property
-    def is_fully_filled(self) -> bool:
-        """True when price has closed fully through the zone (for IFVG derivation)."""
-        return self.status == "MITIGATED"
+    timestamp: pd.Timestamp         # timestamp of the MIDDLE candle
+    timeframe: FVGTF
+    fvg_type: Literal["bullish", "bearish"]
+    zone_high: float
+    zone_low: float
+    zone_ce: float                   # 50% level
+    status: Literal["unfilled", "partial", "filled"] = "unfilled"
+    ce_status: Literal["respected", "violated", "untouched"] = "untouched"
+    fill_timestamp: Optional[pd.Timestamp] = None
+    ce_timestamp: Optional[pd.Timestamp] = None
 
 
-# ---------------------------------------------------------------------------
-# Core detection
-# ---------------------------------------------------------------------------
+@dataclass
+class InverseFVG:
+    timestamp: pd.Timestamp          # when the original FVG was fully filled
+    timeframe: FVGTF
+    ifvg_type: Literal["bullish", "bearish"]   # FLIPPED from source FVG
+    zone_high: float
+    zone_low: float
+    zone_ce: float
+    status: Literal["unfilled", "partial", "any"] = "unfilled"
+    ce_status: Literal["respected", "violated", "untouched"] = "untouched"
+    origin_fvg_timestamp: Optional[pd.Timestamp] = None
 
-def detect_fvgs(
-    highs:          Sequence[float],
-    lows:           Sequence[float],
-    closes:         Sequence[float],
-    timestamps:     Sequence[int],
-    atr_multiplier: float = 0.0,
-    atr_period:     int   = 14,
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _resample(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    rule = {"5m": "5min", "15m": "15min", "1H": "1h", "4H": "4h"}[tf]
+    return df.resample(rule).agg(
+        {"open": "first", "high": "max", "low": "min",
+         "close": "last", "volume": "sum"}
+    ).dropna()
+
+
+def _update_fvg_status(fvg: FVG, row: pd.Series, ts: pd.Timestamp) -> None:
+    """Mutate fvg status and CE status based on a new candle."""
+    if fvg.status == "filled":
+        return
+
+    # Penetration check
+    if fvg.fvg_type == "bullish":
+        # Bullish FVG — price should retrace DOWN into zone
+        low = min(row["open"], row["close"], row["low"])
+        if low <= fvg.zone_low:
+            fvg.status = "filled"
+            fvg.fill_timestamp = ts
+        elif low <= fvg.zone_high:
+            fvg.status = "partial"
+    else:
+        # Bearish FVG — price should retrace UP into zone
+        high = max(row["open"], row["close"], row["high"])
+        if high >= fvg.zone_high:
+            fvg.status = "filled"
+            fvg.fill_timestamp = ts
+        elif high >= fvg.zone_low:
+            fvg.status = "partial"
+
+    # CE check
+    if fvg.ce_status == "untouched":
+        if fvg.fvg_type == "bullish":
+            low_body = min(row["open"], row["close"])
+            if row["low"] <= fvg.zone_ce:
+                if low_body <= fvg.zone_ce:
+                    fvg.ce_status = "violated"
+                else:
+                    fvg.ce_status = "respected"
+                fvg.ce_timestamp = ts
+        else:
+            high_body = max(row["open"], row["close"])
+            if row["high"] >= fvg.zone_ce:
+                if high_body >= fvg.zone_ce:
+                    fvg.ce_status = "violated"
+                else:
+                    fvg.ce_status = "respected"
+                fvg.ce_timestamp = ts
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# FVG DETECTOR
+# ════════════════════════════════════════════════════════════════════════════
+
+def detect_fvg(
+    df: pd.DataFrame,
+    timeframe: FVGTF = "15m",
+    fvg_type: FVGType = "Both",
+    status_filter: FVGStatus = "Any",
+    ce_filter: CEFilter = "Any",
+    min_gap_mult: float = 0.1,   # gap must be > mult × ATR to avoid micro-gaps
+    atr_period: int = 14,
 ) -> List[FVG]:
     """
-    Detect and track FVGs across the full bar array.
-
-    Detection fires at bar i, using candles i, i-1, i-2.
-    Mitigation is updated in the same pass for all active FVGs.
-
-    Parameters
-    ----------
-    highs, lows, closes : OHLCV arrays, oldest first
-    timestamps          : unix ms per bar
-    atr_multiplier      : minimum gap size as multiple of ATR(14).
-                          0.0 = accept all. 0.1 recommended for production.
-    atr_period          : ATR lookback (default 14)
-
-    Returns
-    -------
-    List[FVG] with status updated through the full history, sorted bar_index asc.
+    Detect all FVGs in the resampled OHLCV data and track their status.
     """
-    highs  = list(highs)
-    lows   = list(lows)
-    closes = list(closes)
-    timestamps = list(timestamps)
-    bars   = len(closes)
+    tf_df = _resample(df, timeframe).copy()
+    n     = len(tf_df)
+    if n < atr_period + 3:
+        return []
 
-    if not (bars == len(highs) == len(lows) == len(timestamps)):
-        raise ValueError("All arrays must have the same length")
+    tr = pd.concat([
+        tf_df["high"] - tf_df["low"],
+        (tf_df["high"] - tf_df["close"].shift()).abs(),
+        (tf_df["low"]  - tf_df["close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    tf_df["atr"] = tr.rolling(atr_period, min_periods=1).mean()
 
-    fvgs: List[FVG] = []
+    all_fvgs: List[FVG] = []
+    idx = tf_df.index
 
-    for i in range(2, bars):
-        # Candle indices (oldest-first array, Pine [0]=current [2]=older)
-        c0_h, c0_l = highs[i],     lows[i]      # current bar
-        c2_h, c2_l = highs[i-2],   lows[i-2]    # pre-impulse bar
+    # ── Formation pass ────────────────────────────────────────────────────
+    for i in range(2, n):
+        c0 = tf_df.iloc[i - 2]   # candle n-2
+        c1 = tf_df.iloc[i - 1]   # middle candle  (FVG body)
+        c2 = tf_df.iloc[i]       # candle n
+        atr_i = tf_df["atr"].iloc[i]
+        min_gap = min_gap_mult * atr_i
 
-        # Size filter
-        atr_val = _atr(highs, lows, closes, atr_period, i) if atr_multiplier > 0 else 0.0
+        # Bullish FVG: gap between c0.high and c2.low
+        if fvg_type in ("Bullish", "Both"):
+            gap = c2["low"] - c0["high"]
+            if gap > min_gap:
+                all_fvgs.append(FVG(
+                    timestamp  = idx[i - 1],
+                    timeframe  = timeframe,
+                    fvg_type   = "bullish",
+                    zone_high  = c2["low"],
+                    zone_low   = c0["high"],
+                    zone_ce    = (c2["low"] + c0["high"]) / 2,
+                ))
 
-        # ── Bullish FVG: gap above candle_2's high ──────────────────────
-        if c0_l > c2_h:
-            gap_size = c0_l - c2_h
-            if gap_size > atr_multiplier * atr_val:
-                fvg = FVG(
-                    bar_index   = i,
-                    timestamp   = timestamps[i],
-                    direction   = "BULLISH",
-                    top         = c0_l,
-                    bottom      = c2_h,
-                    midline     = (c0_l + c2_h) / 2,
-                    impulse_bar = i - 1,
-                    gap_size    = gap_size,
-                )
-                fvgs.append(fvg)
+        # Bearish FVG: gap between c2.high and c0.low
+        if fvg_type in ("Bearish", "Both"):
+            gap = c0["low"] - c2["high"]
+            if gap > min_gap:
+                all_fvgs.append(FVG(
+                    timestamp  = idx[i - 1],
+                    timeframe  = timeframe,
+                    fvg_type   = "bearish",
+                    zone_high  = c0["low"],
+                    zone_low   = c2["high"],
+                    zone_ce    = (c0["low"] + c2["high"]) / 2,
+                ))
 
-        # ── Bearish FVG: gap below candle_2's low ───────────────────────
-        if c0_h < c2_l:
-            gap_size = c2_l - c0_h
-            if gap_size > atr_multiplier * atr_val:
-                fvg = FVG(
-                    bar_index   = i,
-                    timestamp   = timestamps[i],
-                    direction   = "BEARISH",
-                    top         = c2_l,
-                    bottom      = c0_h,
-                    midline     = (c2_l + c0_h) / 2,
-                    impulse_bar = i - 1,
-                    gap_size    = gap_size,
-                )
-                fvgs.append(fvg)
+    # ── Status tracking pass ──────────────────────────────────────────────
+    # For each FVG, iterate candles AFTER its formation
+    fvg_by_ts = {fvg.timestamp: fvg for fvg in all_fvgs}
+    active: List[FVG] = []
 
-    # ── Second pass: update mitigation status for all FVGs ──────────────
-    for fvg in fvgs:
-        start = fvg.bar_index + 1
-        for j in range(start, bars):
-            h, l, c = highs[j], lows[j], closes[j]
+    for ts, row in tf_df.iterrows():
+        # Activate any FVG formed at this timestamp
+        if ts in fvg_by_ts:
+            active.append(fvg_by_ts[ts])
+        # Update all active FVGs
+        still_active = []
+        for fvg in active:
+            if fvg.timestamp >= ts:
+                still_active.append(fvg)
+                continue
+            _update_fvg_status(fvg, row, ts)
+            if fvg.status != "filled":
+                still_active.append(fvg)
+            # filled FVGs are kept in all_fvgs but removed from active queue
+        active = still_active
 
-            if fvg.direction == "BULLISH":
-                if l <= fvg.top and fvg.partial_bar is None:
-                    fvg.status      = "PARTIAL"
-                    fvg.partial_bar = j
-                    fvg.first_touch_bar = j
-                if c < fvg.bottom:
-                    fvg.status        = "MITIGATED"
-                    fvg.mitigated_bar = j
-                    break
-
-            else:  # BEARISH
-                if h >= fvg.bottom and fvg.partial_bar is None:
-                    fvg.status      = "PARTIAL"
-                    fvg.partial_bar = j
-                    fvg.first_touch_bar = j
-                if c > fvg.top:
-                    fvg.status        = "MITIGATED"
-                    fvg.mitigated_bar = j
-                    break
-
-    fvgs.sort(key=lambda f: f.bar_index)
-    return fvgs
-
-
-# ---------------------------------------------------------------------------
-# Query helpers
-# ---------------------------------------------------------------------------
-
-def get_active_fvgs_at_bar(
-    fvgs:      List[FVG],
-    bar_index: int,
-    direction: Optional[str] = None,
-) -> List[FVG]:
-    """
-    Return FVGs that:
-      1. Were confirmed at or before bar_index
-      2. Are still ACTIVE or PARTIAL at bar_index (not yet mitigated)
-
-    Parameters
-    ----------
-    direction : "BULLISH", "BEARISH", or None (both)
-    """
+    # ── Apply filters ──────────────────────────────────────────────────────
     result = []
-    for fvg in fvgs:
-        if fvg.bar_index > bar_index:
+    for fvg in all_fvgs:
+        if status_filter != "Any":
+            if fvg.status != status_filter.lower():
+                continue
+        if ce_filter == "Respect" and fvg.ce_status != "respected":
             continue
-        if direction and fvg.direction != direction:
+        if ce_filter == "Violate" and fvg.ce_status != "violated":
             continue
-        # Still active at this bar?
-        if fvg.status == "ACTIVE":
-            result.append(fvg)
-        elif fvg.status == "PARTIAL" and fvg.partial_bar <= bar_index:
-            result.append(fvg)
-        elif fvg.status == "MITIGATED" and fvg.mitigated_bar > bar_index:
-            # Was still active at bar_index even though later mitigated
-            result.append(fvg)
+        result.append(fvg)
+
     return result
 
 
-def get_nearest_fvg(
-    fvgs:      List[FVG],
-    bar_index: int,
-    price:     float,
-    direction: Optional[str] = None,
-) -> Optional[FVG]:
+# ════════════════════════════════════════════════════════════════════════════
+# INVERSE FVG DETECTOR
+# ════════════════════════════════════════════════════════════════════════════
+
+def detect_ifvg(
+    df: pd.DataFrame,
+    timeframe: FVGTF = "15m",
+    ifvg_type: FVGType = "Both",
+    status_filter: FVGStatus = "Any",
+    ce_filter: CEFilter = "Any",
+    min_gap_mult: float = 0.1,
+    atr_period: int = 14,
+) -> List[InverseFVG]:
     """
-    Return the active FVG whose midline is closest to `price` at bar_index.
-    Used by confluence scorer to find the most relevant FVG near current price.
+    Detect Inverse FVGs — fully filled FVGs that now act in reverse.
     """
-    active = get_active_fvgs_at_bar(fvgs, bar_index, direction)
-    if not active:
-        return None
-    return min(active, key=lambda f: abs(f.midline - price))
+    # Get ALL FVGs regardless of fill status
+    all_fvgs = detect_fvg(df, timeframe, "Both", "Any", "Any",
+                           min_gap_mult, atr_period)
+
+    tf_df = _resample(df, timeframe)
+    ifvgs: List[InverseFVG] = []
+
+    for fvg in all_fvgs:
+        if fvg.status != "filled":
+            continue
+
+        # Flip type for IFVG
+        new_type: Literal["bullish", "bearish"] = (
+            "bullish" if fvg.fvg_type == "bearish" else "bearish"
+        )
+
+        wanted = {"bullish", "bearish"} if ifvg_type == "Both" else {ifvg_type.lower()}
+        if new_type not in wanted:
+            continue
+
+        ifvg_obj = InverseFVG(
+            timestamp            = fvg.fill_timestamp or fvg.timestamp,
+            timeframe            = timeframe,
+            ifvg_type            = new_type,
+            zone_high            = fvg.zone_high,
+            zone_low             = fvg.zone_low,
+            zone_ce              = fvg.zone_ce,
+            origin_fvg_timestamp = fvg.timestamp,
+        )
+
+        # Track IFVG status and CE post-fill
+        if fvg.fill_timestamp is not None:
+            try:
+                post_fill = tf_df.loc[tf_df.index > fvg.fill_timestamp]
+            except Exception:
+                ifvgs.append(ifvg_obj)
+                continue
+
+            for ts, row in post_fill.iterrows():
+                if ifvg_obj.status in ("partial", "any"):
+                    break
+                # IFVG acts as opposite zone — check for price returning
+                if new_type == "bullish":
+                    # Expecting price to come back down to this zone as support
+                    if row["low"] <= ifvg_obj.zone_high:
+                        ifvg_obj.status = "partial"
+                        if row["low"] <= ifvg_obj.zone_ce:
+                            ifvg_obj.ce_status = "violated"
+                            ifvg_obj.ce_timestamp = ts
+                        else:
+                            ifvg_obj.ce_status = "respected"
+                            ifvg_obj.ce_timestamp = ts
+                else:
+                    if row["high"] >= ifvg_obj.zone_low:
+                        ifvg_obj.status = "partial"
+                        if row["high"] >= ifvg_obj.zone_ce:
+                            ifvg_obj.ce_status = "violated"
+                            ifvg_obj.ce_timestamp = ts
+                        else:
+                            ifvg_obj.ce_status = "respected"
+                            ifvg_obj.ce_timestamp = ts
+
+        # Apply filters
+        if status_filter != "Any" and ifvg_obj.status != status_filter.lower():
+            continue
+        if ce_filter == "Respect" and ifvg_obj.ce_status != "respected":
+            continue
+        if ce_filter == "Violate" and ifvg_obj.ce_status != "violated":
+            continue
+
+        ifvgs.append(ifvg_obj)
+
+    return ifvgs
 
 
-def get_unfilled_fvgs(
-    fvgs: List[FVG],
-    direction: Optional[str] = None,
-) -> List[FVG]:
-    """Return all FVGs that were never mitigated (status ACTIVE or PARTIAL)."""
-    return [f for f in fvgs
-            if f.status != "MITIGATED"
-            and (direction is None or f.direction == direction)]
-
-
-# ---------------------------------------------------------------------------
-# Self-test
-# ---------------------------------------------------------------------------
+# ── self-test ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import math, sys
-    sys.path.insert(0, ".")
+    import random
+    random.seed(55)
+    n   = 3000
+    idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+    close = 1.0800
+    rows  = []
+    for i in range(n):
+        close += random.gauss(0.0001, 0.0008)
+        o = close - abs(random.gauss(0, 0.0003))
+        h = max(o, close) + abs(random.gauss(0, 0.0004))
+        l = min(o, close) - abs(random.gauss(0, 0.0004))
+        rows.append({"open": o, "high": h, "low": l,
+                     "close": close, "volume": random.randint(100, 2000)})
+    df = pd.DataFrame(rows, index=idx)
 
-    print("=" * 60)
-    print("fvg_detector.py — self test")
-    print("=" * 60)
-
-    N = 100
-    ts_base = 1_700_000_000_000
-
-    # Build a price series with intentional gaps
-    # At bar 10: bullish impulse with gap above
-    # At bar 40: bearish impulse with gap below
-    highs  = [100.5] * N
-    lows   = [99.5]  * N
-    closes = [100.0] * N
-
-    # Inject bullish FVG at bar 12 (candle_2=10, impulse=11, current=12)
-    highs[10]  = 101.0; lows[10]  = 99.5;  closes[10] = 100.8
-    highs[11]  = 104.0; lows[11]  = 101.2; closes[11] = 103.8  # impulse
-    highs[12]  = 106.0; lows[12]  = 101.5; closes[12] = 105.5  # current; low > high[10]=101.0 → gap!
-
-    # Inject bearish FVG at bar 42 (candle_2=40, impulse=41, current=42)
-    highs[40]  = 100.5; lows[40]  = 99.0;  closes[40] = 99.2
-    highs[41]  = 98.8;  lows[41]  = 95.0;  closes[41] = 95.5   # bearish impulse
-    highs[42]  = 98.5;  lows[42]  = 93.0;  closes[42] = 93.8   # current; high[42]=98.5 < low[40]=99.0 → gap!
-
-    ts_arr = [ts_base + i * 60_000 for i in range(N)]
-
-    fvgs = detect_fvgs(highs, lows, closes, ts_arr)
-
-    print(f"\nDetected {len(fvgs)} FVGs:")
-    for f in fvgs:
-        print(f"  {f}")
-
-    bull_fvgs = [f for f in fvgs if f.direction == "BULLISH"]
-    bear_fvgs = [f for f in fvgs if f.direction == "BEARISH"]
-    assert len(bull_fvgs) >= 1, "Expected at least 1 bullish FVG"
-    assert len(bear_fvgs) >= 1, "Expected at least 1 bearish FVG"
-    print(f"\n  Bullish FVGs: {len(bull_fvgs)}")
-    print(f"  Bearish FVGs: {len(bear_fvgs)}")
-
-    # Check zones on injected FVGs
-    bfvg = next(f for f in bull_fvgs if f.bar_index == 12)
-    assert bfvg.bottom == 101.0, f"Bullish FVG bottom wrong: {bfvg.bottom}"
-    assert bfvg.top    == 101.5, f"Bullish FVG top wrong: {bfvg.top}"
-    print(f"\n  Bullish FVG zone: [{bfvg.bottom}, {bfvg.top}] ✓")
-
-    berfvg = next(f for f in bear_fvgs if f.bar_index == 42)
-    assert berfvg.top    == 99.0, f"Bearish FVG top wrong: {berfvg.top}"
-    assert berfvg.bottom == 98.5, f"Bearish FVG bottom wrong: {berfvg.bottom}"
-    print(f"  Bearish FVG zone: [{berfvg.bottom}, {berfvg.top}] ✓")
-
-    # Test active at bar query
-    active_at_50 = get_active_fvgs_at_bar(fvgs, bar_index=50)
-    print(f"\n  Active FVGs at bar 50: {len(active_at_50)}")
-
-    # Test FVG not visible before its bar
-    active_at_11 = get_active_fvgs_at_bar(fvgs, bar_index=11)
-    bull_at_11 = [f for f in active_at_11 if f.bar_index == 12]
-    assert len(bull_at_11) == 0, "LOOK-AHEAD: FVG at bar 12 should not be visible at bar 11"
-    print("  Look-ahead check: FVG at bar 12 not visible at bar 11 ✓")
-
-    # Test mitigation with a fully isolated price series
-    N2  = 40
-    h2  = [100.2] * N2; l2 = [99.8] * N2; c2 = [100.0] * N2
-    ts2 = [ts_base + i * 60_000 for i in range(N2)]
-    # Clean bullish FVG: pre=4, impulse=5, current=6
-    h2[4]=100.2; l2[4]=99.8;  c2[4]=100.0
-    h2[5]=103.0; l2[5]=100.3; c2[5]=102.8   # impulse
-    h2[6]=105.0; l2[6]=102.5; c2[6]=104.8   # low(102.5) > high[4](100.2) → gap zone [100.2, 102.5]
-    for i in range(7, 15):
-        h2[i]=105.5; l2[i]=104.5; c2[i]=105.0  # flat above zone
-    h2[15]=104.0; l2[15]=101.5; c2[15]=103.5   # wick into zone (partial)
-    for i in range(16, 20):
-        h2[i]=103.5; l2[i]=102.8; c2[i]=103.2  # stay above
-    h2[20]=101.5; l2[20]=99.5;  c2[20]=100.0   # close below 100.2 → mitigated
-
-    fvgs2 = detect_fvgs(h2, l2, c2, ts2)
-    bfvg2 = next((f for f in fvgs2 if f.direction=="BULLISH"
-                  and f.bar_index==6 and abs(f.bottom-100.2)<0.01), None)
-    assert bfvg2 is not None, f"Expected bullish FVG at bar 6. Got: {fvgs2}"
-    assert bfvg2.status == "MITIGATED", f"Expected MITIGATED, got {bfvg2.status}"
-    assert bfvg2.partial_bar == 15, f"Expected partial_bar=15, got {bfvg2.partial_bar}"
-    assert bfvg2.mitigated_bar == 20, f"Expected mitigated_bar=20, got {bfvg2.mitigated_bar}"
-    print(f"  Mitigation: partial at bar 15, mitigated at bar 20 \u2713")
-
-    print("\n✅ All tests passed")
+    for tf in ("5m", "15m", "1H"):
+        fvgs  = detect_fvg(df, tf, "Both", "Any", "Any")
+        ifvgs = detect_ifvg(df, tf, "Both", "Any", "Any")
+        filled = [f for f in fvgs if f.status == "filled"]
+        print(f"[{tf}] FVGs={len(fvgs)}  filled={len(filled)}  IFVGs={len(ifvgs)}")

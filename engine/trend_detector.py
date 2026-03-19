@@ -1,293 +1,201 @@
 """
 trend_detector.py
-=================
-Wicks SMC Backtesting Engine — Layer 2
+─────────────────
+ICT Market Trend Bias — HTF directional analysis.
 
-Determines market trend by reading the sequence of confirmed swing highs
-and swing lows produced by swing_detector.py.
+Logic:
+  Swing highs / lows are identified via a rolling pivot window.
+  Bullish trend  = series of Higher Highs + Higher Lows (HH/HL).
+  Bearish trend  = series of Lower Highs + Lower Lows (LH/LL).
+  Neutral/ranging = mixed structure.
 
-Pine Script ground truth: TFlab Market Structures indicator
-  - ExternalTrend: sequence of Major swing points (pivot length = 5)
-  - InternalTrend: sequence of Minor swing points (same pivot, filtered)
-
-Logic
------
-Trend is determined by the classic HH/HL / LH/LL classification:
-
-  BULLISH  — price is making Higher Highs AND Higher Lows
-  BEARISH  — price is making Lower Highs AND Lower Lows
-  RANGING  — mixed signals (LH + HL, or insufficient data)
-
-The trend is re-evaluated every time a NEW swing point is confirmed.
-Only swings confirmed at or before the current bar are used (no look-ahead).
-
-Swing classification:
-  HH — swing HIGH above the previous swing HIGH
-  LH — swing HIGH below the previous swing HIGH
-  HL — swing LOW  above the previous swing LOW
-  LL — swing LOW  below the previous swing LOW
-
-Trend state machine (mirrors TFlab ExternalTrend):
-  Start     → RANGING (no data)
-  Any BOS/CHoCH bullish  → BULLISH
-  Any BOS/CHoCH bearish  → BEARISH
-
-For the trend detector itself (pre-BOS), we use the simpler swing sequence:
-  2 consecutive HH+HL     → BULLISH
-  2 consecutive LH+LL     → BEARISH
-  Mixed                   → RANGING
-
-Output
-------
-  TrendState dataclass per bar evaluated, containing:
-    bar_index   int
-    timestamp   int
-    trend       str  — "BULLISH", "BEARISH", "RANGING"
-    last_hh     float | None  — price of most recent confirmed HH
-    last_hl     float | None
-    last_lh     float | None
-    last_ll     float | None
-
-Usage
------
-  from swing_detector import detect_swings
-  from trend_detector import detect_trend, get_trend_at_bar
-
-  swings = detect_swings(highs, lows, timestamps, method="pivot", length=5)
-  trend_states = detect_trend(swings, timestamps)
-  current = get_trend_at_bar(trend_states, bar_index=150)
+Supported timeframes: 1H | 4H | Daily
 """
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
-from swing_detector import SwingPoint
+from typing import Literal, List
+import pandas as pd
+import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TrendState:
-    bar_index:  int
-    timestamp:  int
-    trend:      str          # "BULLISH", "BEARISH", "RANGING"
-
-    # Most recent confirmed swing prices at this bar
-    last_hh:    Optional[float] = None   # last Higher High
-    last_hl:    Optional[float] = None   # last Higher Low
-    last_lh:    Optional[float] = None   # last Lower High
-    last_ll:    Optional[float] = None   # last Lower Low
-
-    # Raw last swing prices (regardless of HH/LH classification)
-    last_swing_high: Optional[float] = None
-    last_swing_low:  Optional[float] = None
-
-    def __repr__(self):
-        return (f"TrendState(bar={self.bar_index} trend={self.trend} "
-                f"HH={self.last_hh} HL={self.last_hl} "
-                f"LH={self.last_lh} LL={self.last_ll})")
+TrendBias  = Literal["bullish", "bearish", "neutral"]
+TrendTF    = Literal["1H", "4H", "Daily"]
 
 
 @dataclass
-class SwingLabel:
-    """A swing point with its HH/LH/HL/LL classification."""
-    swing:      SwingPoint
-    label:      str   # "HH", "LH", "HL", "LL"
+class SwingPoint:
+    timestamp: pd.Timestamp
+    price: float
+    kind: Literal["HH", "HL", "LH", "LL"]
 
 
-# ---------------------------------------------------------------------------
-# Core detection
-# ---------------------------------------------------------------------------
+@dataclass
+class TrendSignal:
+    timestamp: pd.Timestamp
+    timeframe: TrendTF
+    bias: TrendBias
+    swing_points: List[SwingPoint] = field(default_factory=list)
+    confidence: float = 0.0          # 0–1 based on how many consecutive pivots align
+    confirmed: bool = False
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _resample(df: pd.DataFrame, tf: TrendTF) -> pd.DataFrame:
+    rule_map = {"1H": "1h", "4H": "4h", "Daily": "1D"}
+    rule = rule_map[tf]
+    agg = {"open": "first", "high": "max", "low": "min",
+           "close": "last", "volume": "sum"}
+    return df.resample(rule).agg(agg).dropna()
+
+
+def _find_swings(df: pd.DataFrame, pivot_window: int = 3) -> pd.DataFrame:
+    """Tag each candle as pivot high / pivot low / none."""
+    highs = df["high"].values
+    lows  = df["low"].values
+    n     = len(df)
+    pivot_high = np.zeros(n, dtype=bool)
+    pivot_low  = np.zeros(n, dtype=bool)
+
+    for i in range(pivot_window, n - pivot_window):
+        window_h = highs[i - pivot_window: i + pivot_window + 1]
+        window_l = lows [i - pivot_window: i + pivot_window + 1]
+        if highs[i] == window_h.max():
+            pivot_high[i] = True
+        if lows[i] == window_l.min():
+            pivot_low[i] = True
+
+    df = df.copy()
+    df["pivot_high"] = pivot_high
+    df["pivot_low"]  = pivot_low
+    return df
+
+
+def _classify_structure(pivot_highs: List[float],
+                         pivot_lows: List[float]) -> tuple[TrendBias, float]:
+    """
+    Given the last N pivot highs and lows, return (bias, confidence 0-1).
+    confidence = fraction of pivot-to-pivot moves that agree with bias.
+    """
+    if len(pivot_highs) < 2 or len(pivot_lows) < 2:
+        return "neutral", 0.0
+
+    # Compare consecutive pivot highs and lows
+    hh_count = sum(1 for a, b in zip(pivot_highs, pivot_highs[1:]) if b > a)
+    hl_count = sum(1 for a, b in zip(pivot_lows,  pivot_lows[1:])  if b > a)
+    lh_count = sum(1 for a, b in zip(pivot_highs, pivot_highs[1:]) if b < a)
+    ll_count = sum(1 for a, b in zip(pivot_lows,  pivot_lows[1:])  if b < a)
+
+    bull_score = hh_count + hl_count
+    bear_score = lh_count + ll_count
+    total      = max(bull_score + bear_score, 1)
+
+    if bull_score > bear_score:
+        return "bullish", round(bull_score / total, 2)
+    elif bear_score > bull_score:
+        return "bearish", round(bear_score / total, 2)
+    return "neutral", 0.5
+
+
+# ── public API ────────────────────────────────────────────────────────────────
 
 def detect_trend(
-    swings:     List[SwingPoint],
-    timestamps: Sequence[int],
-    method:     str = "pivot",
-    length:     int = 5,
-) -> List[TrendState]:
+    df: pd.DataFrame,          # 1-min base OHLCV, DatetimeIndex UTC
+    timeframe: TrendTF = "4H",
+    bias_filter: Literal["Bullish", "Bearish", "Both"] = "Both",
+    pivot_window: int = 3,
+    lookback_pivots: int = 6,  # how many recent pivots to score
+) -> List[TrendSignal]:
     """
-    Compute trend state for every bar in `timestamps`.
-
-    Parameters
-    ----------
-    swings     : output of swing_detector.detect_swings()
-    timestamps : full bar timestamp array (unix ms), oldest first
-    method     : filter swings by this method ("pivot" matches TFlab)
-    length     : filter swings by this length (5 matches TFlab default)
-
-    Returns
-    -------
-    List[TrendState], one per bar, sorted bar_index ascending.
+    Returns a list of TrendSignal objects, one per timeframe candle where
+    the structural bias matches bias_filter.
     """
-    # Filter to the correct method/length
-    filtered = [s for s in swings
-                if s.method == method and s.length == length]
+    tf_df   = _resample(df, timeframe)
+    tf_df   = _find_swings(tf_df, pivot_window)
+    signals: List[TrendSignal] = []
 
-    highs_seq = [s for s in filtered if s.direction == "HIGH"]
-    lows_seq  = [s for s in filtered if s.direction == "LOW"]
+    ph_prices: List[float] = []
+    pl_prices: List[float] = []
+    ph_times:  List[pd.Timestamp] = []
+    pl_times:  List[pd.Timestamp] = []
 
-    # Sort by confirmed_bar so we process in time order
-    highs_seq.sort(key=lambda s: s.confirmed_bar)
-    lows_seq.sort(key=lambda s:  s.confirmed_bar)
+    for ts, row in tf_df.iterrows():
+        if row["pivot_high"]:
+            ph_prices.append(row["high"])
+            ph_times.append(ts)
+        if row["pivot_low"]:
+            pl_prices.append(row["low"])
+            pl_times.append(ts)
 
-    # State tracking
-    prev_high:  Optional[float] = None
-    prev_low:   Optional[float] = None
-    last_hh:    Optional[float] = None
-    last_hl:    Optional[float] = None
-    last_lh:    Optional[float] = None
-    last_ll:    Optional[float] = None
-    trend:      str             = "RANGING"
+        # Only classify once we have enough pivots
+        if len(ph_prices) < 2 or len(pl_prices) < 2:
+            continue
 
-    # Pointers into sorted swing lists
-    hi_idx = 0
-    lo_idx = 0
+        recent_highs = ph_prices[-lookback_pivots:]
+        recent_lows  = pl_prices[-lookback_pivots:]
+        bias, conf   = _classify_structure(recent_highs, recent_lows)
 
-    results: List[TrendState] = []
+        # Apply bias filter
+        wanted = {"bullish", "bearish"} if bias_filter == "Both" else {bias_filter.lower()}
+        if bias not in wanted:
+            continue
 
-    for bar_i, ts in enumerate(timestamps):
+        # Build swing points for context
+        swings: List[SwingPoint] = []
+        for t, p in zip(ph_times[-3:], ph_prices[-3:]):
+            kind = "HH" if len(ph_prices) > 1 and p > ph_prices[-2] else "LH"
+            swings.append(SwingPoint(t, p, kind))
+        for t, p in zip(pl_times[-3:], pl_prices[-3:]):
+            kind = "HL" if len(pl_prices) > 1 and p > pl_prices[-2] else "LL"
+            swings.append(SwingPoint(t, p, kind))
 
-        # Consume all swings confirmed at or before this bar
-        while hi_idx < len(highs_seq) and highs_seq[hi_idx].confirmed_bar <= bar_i:
-            sh = highs_seq[hi_idx]
-            if prev_high is None:
-                prev_high = sh.price
-            else:
-                if sh.price > prev_high:
-                    last_hh   = sh.price
-                    last_lh   = None          # reset opposite
-                else:
-                    last_lh   = sh.price
-                    last_hh   = None
-                prev_high = sh.price
-            hi_idx += 1
-
-        while lo_idx < len(lows_seq) and lows_seq[lo_idx].confirmed_bar <= bar_i:
-            sl = lows_seq[lo_idx]
-            if prev_low is None:
-                prev_low = sl.price
-            else:
-                if sl.price > prev_low:
-                    last_hl   = sl.price
-                    last_ll   = None
-                else:
-                    last_ll   = sl.price
-                    last_hl   = None
-                prev_low = sl.price
-            lo_idx += 1
-
-        # Determine trend from current HH/HL/LH/LL state
-        if last_hh is not None and last_hl is not None:
-            trend = "BULLISH"
-        elif last_lh is not None and last_ll is not None:
-            trend = "BEARISH"
-        # else: trend stays as previous (persistence)
-
-        results.append(TrendState(
-            bar_index        = bar_i,
-            timestamp        = ts,
-            trend            = trend,
-            last_hh          = last_hh,
-            last_hl          = last_hl,
-            last_lh          = last_lh,
-            last_ll          = last_ll,
-            last_swing_high  = prev_high,
-            last_swing_low   = prev_low,
+        signals.append(TrendSignal(
+            timestamp  = ts,
+            timeframe  = timeframe,
+            bias       = bias,
+            swing_points = sorted(swings, key=lambda s: s.timestamp),
+            confidence = conf,
+            confirmed  = conf >= 0.6,
         ))
 
-    return results
+    return signals
 
 
-# ---------------------------------------------------------------------------
-# Query helpers
-# ---------------------------------------------------------------------------
-
-def get_trend_at_bar(
-    trend_states: List[TrendState],
-    bar_index:    int,
-) -> Optional[TrendState]:
-    """Return the TrendState for exactly bar_index, or None."""
-    if bar_index < 0 or bar_index >= len(trend_states):
-        return None
-    return trend_states[bar_index]
-
-
-def get_trend_str_at_bar(
-    trend_states: List[TrendState],
-    bar_index:    int,
-) -> str:
-    """Return trend string at bar_index, defaulting to 'RANGING'."""
-    state = get_trend_at_bar(trend_states, bar_index)
-    return state.trend if state else "RANGING"
+def get_current_bias(
+    df: pd.DataFrame,
+    timeframe: TrendTF = "4H",
+    pivot_window: int = 3,
+) -> tuple[TrendBias, float]:
+    """Convenience: return current bias + confidence for the latest candle."""
+    sigs = detect_trend(df, timeframe, "Both", pivot_window)
+    if not sigs:
+        return "neutral", 0.0
+    last = sigs[-1]
+    return last.bias, last.confidence
 
 
-def find_trend_changes(
-    trend_states: List[TrendState],
-) -> List[TrendState]:
-    """Return only the bars where trend changed from the previous bar."""
-    changes = []
-    prev = "RANGING"
-    for ts in trend_states:
-        if ts.trend != prev:
-            changes.append(ts)
-            prev = ts.trend
-    return changes
-
-
-# ---------------------------------------------------------------------------
-# Self-test
-# ---------------------------------------------------------------------------
+# ── self-test ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import math, sys
-    sys.path.insert(0, ".")
-    from swing_detector import detect_swings
+    import random, datetime
+    random.seed(42)
 
-    print("=" * 60)
-    print("trend_detector.py — self test")
-    print("=" * 60)
+    # Generate synthetic 1-min OHLCV trending upward
+    n   = 1000
+    idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+    close = 1.0800
+    rows  = []
+    for i in range(n):
+        close += random.gauss(0.0002, 0.0008)   # slight upward drift
+        o = close - abs(random.gauss(0, 0.0003))
+        h = max(o, close) + abs(random.gauss(0, 0.0003))
+        l = min(o, close) - abs(random.gauss(0, 0.0003))
+        rows.append({"open": o, "high": h, "low": l,
+                     "close": close, "volume": random.randint(100, 1000)})
 
-    N  = 120
-    ts_base = 1_700_000_000_000
+    df = pd.DataFrame(rows, index=idx)
 
-    # Build an uptrend then downtrend series
-    # Bars 0-59:  rising sine → should resolve BULLISH
-    # Bars 60-119: falling   → should resolve BEARISH
-    def make_price(i):
-        if i < 60:
-            return 100 + i * 0.3 + 5 * math.sin(2 * math.pi * i / 16)
-        else:
-            return 118 - (i - 60) * 0.3 + 5 * math.sin(2 * math.pi * i / 16)
-
-    mid  = [make_price(i) for i in range(N)]
-    highs  = [m + 0.6 for m in mid]
-    lows   = [m - 0.6 for m in mid]
-    ts_arr = [ts_base + i * 300_000 for i in range(N)]  # 5-min bars
-
-    swings = detect_swings(highs, lows, ts_arr, method="pivot", length=5)
-    states = detect_trend(swings, ts_arr)
-
-    changes = find_trend_changes(states)
-    print(f"\nDetected {len(swings)} swing points")
-    print(f"Trend changes:")
-    for c in changes:
-        print(f"  bar={c.bar_index:3d}  → {c.trend}")
-
-    # By bar 50 we should be BULLISH
-    t50 = get_trend_at_bar(states, 50)
-    print(f"\nTrend at bar 50: {t50.trend}")
-    assert t50.trend == "BULLISH", f"Expected BULLISH at bar 50, got {t50.trend}"
-
-    # By bar 110 we should be BEARISH
-    t110 = get_trend_at_bar(states, 110)
-    print(f"Trend at bar 110: {t110.trend}")
-    assert t110.trend == "BEARISH", f"Expected BEARISH at bar 110, got {t110.trend}"
-
-    # Trend at bar 0 should be RANGING (not enough data)
-    t0 = get_trend_at_bar(states, 0)
-    assert t0.trend == "RANGING"
-    print(f"Trend at bar 0:   {t0.trend} (expected RANGING)")
-
-    print("\n✅ All tests passed")
+    for tf in ("1H", "4H", "Daily"):
+        bias, conf = get_current_bias(df, tf)
+        print(f"[{tf}] bias={bias}  confidence={conf:.0%}")

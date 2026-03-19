@@ -1,381 +1,338 @@
 """
 liquidity_detector.py
-=====================
-Wicks SMC Backtesting Engine — Layer 3
+─────────────────────
+ICT Liquidity confluence detection:
 
-Detects Liquidity Sweeps — price movements that briefly exceed a prior swing
-high/low (grabbing stops), then sharply reverse direction.
+  1. Liquidity Sweep
+     Price spikes beyond equal highs / equal lows (EQH/EQL) or
+     a prior swing high/low, then sharply reverses on the same candle.
+     Buy-side  sweep — spike above buy-side liquidity (prior highs)
+     Sell-side sweep — spike below sell-side liquidity (prior lows)
 
-Definition (ICT)
-----------------
-An ICT Liquidity Sweep occurs when price:
-  1. Targets a prior swing high or low (where retail stops are clustered).
-  2. Exceeds the swing level (either via wick or close).
-  3. REVERSES and closes back in the opposite direction.
+  2. Engineered Liquidity
+     Price creates a DELIBERATE inducement move to lure in traders,
+     then sweeps the liquidity pool and reverses.
 
-This is DISTINCT from a Liquidity Run, where price exceeds the level and
-CONTINUES in that direction. A sweep reverses.
+     Subtypes:
+       Inducement   — a small swing (lower high / higher low) forms after
+                      a BOS; price hunts it before continuing.
+       False Break  — price closes BEYOND a level then immediately reverses
+                      (one-candle false break).
+       Stop Hunt    — price spikes into a known stop cluster
+                      (equal highs / lows ± tolerance) then reverses.
 
-  Buy-side Liquidity Sweep (Bearish sweep of highs):
-    - Price wicks ABOVE a prior swing HIGH.
-    - The bar CLOSES BELOW the swept swing high.
-    - Signals smart money selling after grabbing buy stops above the high.
-    - Bearish reversal expected.
-
-  Sell-side Liquidity Sweep (Bullish sweep of lows):
-    - Price wicks BELOW a prior swing LOW.
-    - The bar CLOSES ABOVE the swept swing low.
-    - Signals smart money buying after grabbing sell stops below the low.
-    - Bullish reversal expected.
-
-Confirmation (optional):
-  Strong sweeps have a next-bar close in the reversal direction.
-  sweep.confirmed = True if close[i+1] continues the reversal.
-
-Sweep quality filter:
-  sweep_ratio: how far price exceeded the swing level as % of ATR.
-  Default: 0.0 (accept any sweep regardless of size).
-  Recommended: 0.1 (price must exceed swing by at least 10% of ATR).
-
-Output
-------
-  LiquiditySweep dataclass:
-    bar_index      int    — bar where the sweep occurred
-    timestamp      int
-    direction      str    — "BULLISH" (sell-side swept → bullish) or
-                            "BEARISH" (buy-side swept → bearish)
-    swept_price    float  — the prior swing price that was swept
-    sweep_high     float  — the actual high of the sweep bar
-    sweep_low      float  — the actual low of the sweep bar
-    sweep_excess   float  — how far price went beyond the swing level
-    confirmed      bool   — True if next bar confirms reversal direction
-    swing_bar      int    — bar index of the swept swing point
-    used           bool   — True if already consumed by a trade signal
-
-Usage
------
-  from swing_detector import detect_swings
-  from liquidity_detector import detect_sweeps, get_sweeps_at_bar
-
-  swings = detect_swings(highs, lows, timestamps, method="rolling", length=10)
-  sweeps = detect_sweeps(opens, highs, lows, closes, timestamps, swings)
-  recent = get_sweeps_at_bar(sweeps, bar_index=50, lookback=5)
+Timeframes: 15m | 1H | 4H
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Literal, List, Optional
+import pandas as pd
+import numpy as np
 
-from swing_detector import SwingPoint
+
+LiqType  = Literal["Buy-side", "Sell-side", "Both"]
+EngType  = Literal["Inducement", "False break", "Stop hunt"]
+LiqTF    = Literal["15m", "1H", "4H"]
 
 
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
+# ── data models ───────────────────────────────────────────────────────────────
 
 @dataclass
 class LiquiditySweep:
-    bar_index:    int
-    timestamp:    int
-    direction:    str     # "BULLISH" (sweep of lows → expect up) or
-                          # "BEARISH" (sweep of highs → expect down)
-    swept_price:  float   # prior swing price exceeded
-    sweep_high:   float
-    sweep_low:    float
-    sweep_excess: float   # abs(extremity - swept_price)
-    confirmed:    bool    # next bar closes in reversal direction
-    swing_bar:    int     # bar of the swept swing point
-    used:         bool    = False   # consumed by backtest entry
-
-    def __repr__(self):
-        conf = "✓" if self.confirmed else "~"
-        return (f"LiquiditySweep({self.direction}{conf} swept={self.swept_price:.5f} "
-                f"excess={self.sweep_excess:.5f} bar={self.bar_index})")
+    timestamp: pd.Timestamp
+    timeframe: LiqTF
+    sweep_type: Literal["buy-side", "sell-side"]
+    swept_level: float          # the liquidity pool price
+    wick_extent: float          # how far price went beyond the level
+    reversal_magnitude: float   # close-to-level distance (strength of reversal)
+    confirmed: bool = True
 
 
-# ---------------------------------------------------------------------------
-# Core detection
-# ---------------------------------------------------------------------------
+@dataclass
+class EngineeredLiquidity:
+    timestamp: pd.Timestamp
+    timeframe: LiqTF
+    eng_type: Literal["inducement", "false_break", "stop_hunt"]
+    direction: Literal["bullish", "bearish"]
+    trap_level: float
+    sweep_candle: pd.Timestamp
+    confirmed: bool = True
 
-def detect_sweeps(
-    opens:        Sequence[float],
-    highs:        Sequence[float],
-    lows:         Sequence[float],
-    closes:       Sequence[float],
-    timestamps:   Sequence[int],
-    swings:       List[SwingPoint],
-    sweep_ratio:  float = 0.0,   # min excess as fraction of price (0 = any)
-    swing_method: str   = "rolling",
-    swing_length: int   = 10,
-    require_close_back: bool = True,  # close must be back inside swing level
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _resample(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    rule = {"15m": "15min", "1H": "1h", "4H": "4h"}[tf]
+    return df.resample(rule).agg(
+        {"open": "first", "high": "max", "low": "min",
+         "close": "last", "volume": "sum"}
+    ).dropna()
+
+
+def _equal_levels(series: pd.Series,
+                  tolerance: float) -> List[float]:
+    """Find clusters of 'equal' values within tolerance → return cluster mean."""
+    vals   = series.dropna().values
+    groups: List[list] = []
+    for v in vals:
+        placed = False
+        for g in groups:
+            if abs(v - np.mean(g)) <= tolerance:
+                g.append(v); placed = True; break
+        if not placed:
+            groups.append([v])
+    return [float(np.mean(g)) for g in groups if len(g) >= 2]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# LIQUIDITY SWEEP
+# ════════════════════════════════════════════════════════════════════════════
+
+def detect_liquidity_sweeps(
+    df: pd.DataFrame,
+    timeframe: LiqTF = "1H",
+    sweep_type: LiqType = "Both",
+    pivot_window: int = 3,
+    min_reversal_ratio: float = 0.5,  # reversal must recover ≥50% of sweep wick
 ) -> List[LiquiditySweep]:
     """
-    Detect Liquidity Sweeps across the full bar history.
-
-    Parameters
-    ----------
-    opens, highs, lows, closes : OHLCV arrays, oldest first
-    timestamps                 : unix ms per bar
-    swings                     : from detect_swings()
-    sweep_ratio                : minimum excess beyond swing as fraction of swept_price
-    swing_method, swing_length : filter swings
-    require_close_back         : if True, bar must close back inside swing level
-                                  (strict sweep definition). If False, wick-only sweeps
-                                  are also counted.
-
-    Returns
-    -------
-    List[LiquiditySweep] sorted by bar_index.
+    Identify candles where price sweeps a prior swing high/low then reverses.
+    Classic ICT sweep: wick pokes through the level; body closes BACK inside.
     """
-    highs  = list(highs)
-    lows   = list(lows)
-    closes = list(closes)
-    opens  = list(opens)
-    timestamps = list(timestamps)
-    bars   = len(closes)
+    tf_df  = _resample(df, timeframe)
+    n      = len(tf_df)
+    signals: List[LiquiditySweep] = []
 
-    # Separate and sort swing highs/lows
-    swing_highs = sorted(
-        [s for s in swings if s.direction == "HIGH"
-         and s.method == swing_method and s.length == swing_length],
-        key=lambda s: s.bar_index
-    )
-    swing_lows = sorted(
-        [s for s in swings if s.direction == "LOW"
-         and s.method == swing_method and s.length == swing_length],
-        key=lambda s: s.bar_index
-    )
+    highs  = tf_df["high"].values
+    lows   = tf_df["low"].values
+    opens  = tf_df["open"].values
+    closes = tf_df["close"].values
+    idx    = tf_df.index
 
-    sweeps: List[LiquiditySweep] = []
-    used_bars: set = set()
-    used_swing_bars: set = set()   # prevent multiple sweeps of same swing level
+    # Rolling swing highs / lows (simple lookback)
+    for i in range(pivot_window * 2, n):
+        atr_approx = np.mean(highs[i - 14:i] - lows[i - 14:i]) if i >= 14 else 0.001
 
-    # Track confirmed swings visible at each bar
-    active_highs: List[SwingPoint] = []
-    active_lows:  List[SwingPoint] = []
-    sh_ptr = 0
-    sl_ptr = 0
+        # Prior swing high = max of window before current
+        prior_high = highs[i - pivot_window * 2: i - pivot_window].max()
+        prior_low  = lows [i - pivot_window * 2: i - pivot_window].min()
 
-    for i in range(1, bars):
-        # Ingest newly confirmed swings
-        while sh_ptr < len(swing_highs) and swing_highs[sh_ptr].confirmed_bar <= i:
-            active_highs.append(swing_highs[sh_ptr])
-            sh_ptr += 1
-        while sl_ptr < len(swing_lows) and swing_lows[sl_ptr].confirmed_bar <= i:
-            active_lows.append(swing_lows[sl_ptr])
-            sl_ptr += 1
+        # ── Buy-side sweep (spike above prior high, close below it) ─────
+        if sweep_type in ("Buy-side", "Both"):
+            if highs[i] > prior_high and closes[i] < prior_high:
+                wick      = highs[i] - prior_high
+                reversal  = prior_high - closes[i]
+                if wick > 0 and reversal / (wick + reversal) >= min_reversal_ratio:
+                    signals.append(LiquiditySweep(
+                        timestamp           = idx[i],
+                        timeframe           = timeframe,
+                        sweep_type          = "buy-side",
+                        swept_level         = prior_high,
+                        wick_extent         = wick,
+                        reversal_magnitude  = reversal,
+                    ))
 
-        if i in used_bars:
-            continue
+        # ── Sell-side sweep (spike below prior low, close above it) ─────
+        if sweep_type in ("Sell-side", "Both"):
+            if lows[i] < prior_low and closes[i] > prior_low:
+                wick      = prior_low - lows[i]
+                reversal  = closes[i] - prior_low
+                if wick > 0 and reversal / (wick + reversal) >= min_reversal_ratio:
+                    signals.append(LiquiditySweep(
+                        timestamp           = idx[i],
+                        timeframe           = timeframe,
+                        sweep_type          = "sell-side",
+                        swept_level         = prior_low,
+                        wick_extent         = wick,
+                        reversal_magnitude  = reversal,
+                    ))
 
-        h = highs[i]
-        l = lows[i]
-        c = closes[i]
-
-        # ── Buy-side Liquidity Sweep (bearish outcome) ─────────────────────
-        # Price wicks above prior swing HIGH then closes back below
-        # Only check the most recent confirmed swing high (not already used this bar)
-        recent_highs = [s for s in active_highs if s.bar_index < i and s.bar_index not in used_swing_bars]
-        if recent_highs:
-            sh = recent_highs[-1]
-            if h > sh.price:
-                excess = h - sh.price
-                if sweep_ratio == 0 or excess >= sh.price * sweep_ratio:
-                    close_back = c < sh.price
-
-                    if not require_close_back or close_back:
-                        confirmed = False
-                        if i + 1 < bars:
-                            confirmed = closes[i + 1] < c
-
-                        sweep = LiquiditySweep(
-                            bar_index    = i,
-                            timestamp    = timestamps[i],
-                            direction    = "BEARISH",
-                            swept_price  = sh.price,
-                            sweep_high   = h,
-                            sweep_low    = l,
-                            sweep_excess = excess,
-                            confirmed    = confirmed,
-                            swing_bar    = sh.bar_index,
-                        )
-                        sweeps.append(sweep)
-                        used_bars.add(i)
-                        used_swing_bars.add(sh.bar_index)
-
-        if i in used_bars:
-            continue
-
-        # ── Sell-side Liquidity Sweep (bullish outcome) ────────────────────
-        # Price wicks below prior swing LOW then closes back above
-        recent_lows = [s for s in active_lows if s.bar_index < i and s.bar_index not in used_swing_bars]
-        if recent_lows and i not in used_bars:
-            sl = recent_lows[-1]
-            if l < sl.price:
-                excess = sl.price - l
-                if sweep_ratio == 0 or excess >= sl.price * sweep_ratio:
-                    close_back = c > sl.price
-
-                    if not require_close_back or close_back:
-                        confirmed = False
-                        if i + 1 < bars:
-                            confirmed = closes[i + 1] > c
-
-                        sweep = LiquiditySweep(
-                            bar_index    = i,
-                            timestamp    = timestamps[i],
-                            direction    = "BULLISH",
-                            swept_price  = sl.price,
-                            sweep_high   = h,
-                            sweep_low    = l,
-                            sweep_excess = excess,
-                            confirmed    = confirmed,
-                            swing_bar    = sl.bar_index,
-                        )
-                        sweeps.append(sweep)
-                        used_bars.add(i)
-                        used_swing_bars.add(sl.bar_index)
-
-    sweeps.sort(key=lambda s: s.bar_index)
-    return sweeps
+    return signals
 
 
-# ---------------------------------------------------------------------------
-# Query helpers
-# ---------------------------------------------------------------------------
+# ════════════════════════════════════════════════════════════════════════════
+# ENGINEERED LIQUIDITY
+# ════════════════════════════════════════════════════════════════════════════
 
-def get_sweeps_at_bar(
-    sweeps:    List[LiquiditySweep],
-    bar_index: int,
-    lookback:  int = 10,
-    direction: Optional[str] = None,
-    confirmed_only: bool = False,
-) -> List[LiquiditySweep]:
+def detect_engineered_liquidity(
+    df: pd.DataFrame,
+    timeframe: LiqTF = "1H",
+    eng_type: EngType = "Inducement",
+    pivot_window: int = 3,
+    eql_tolerance_mult: float = 0.15,  # × ATR to consider levels "equal"
+    atr_period: int = 14,
+) -> List[EngineeredLiquidity]:
     """
-    Return sweeps within `lookback` bars of bar_index.
+    Detect engineered liquidity traps.
 
-    Parameters
-    ----------
-    lookback       : how many bars back to look (default 10)
-    direction      : "BULLISH", "BEARISH", or None for both
-    confirmed_only : if True, only return sweeps with confirmed=True
+    Inducement:
+      After a BOS, price creates a small opposing swing.
+      We detect the inducement when price sweeps that opposing swing
+      and then closes back in the original BOS direction.
+
+    False Break:
+      Candle closes beyond a recent extreme then next candle
+      immediately closes back inside.
+
+    Stop Hunt:
+      Price spike into equal highs/lows (EQH/EQL) followed by reversal.
     """
-    result = []
-    for s in sweeps:
-        if s.bar_index > bar_index:
-            continue
-        if s.bar_index < bar_index - lookback:
-            continue
-        if direction and s.direction != direction:
-            continue
-        if confirmed_only and not s.confirmed:
-            continue
-        result.append(s)
-    return result
+    tf_df = _resample(df, timeframe).copy()
+    n     = len(tf_df)
+    if n < atr_period + pivot_window * 2 + 4:
+        return []
+
+    tr = pd.concat([
+        tf_df["high"] - tf_df["low"],
+        (tf_df["high"] - tf_df["close"].shift()).abs(),
+        (tf_df["low"]  - tf_df["close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    tf_df["atr"] = tr.rolling(atr_period, min_periods=1).mean()
+
+    signals: List[EngineeredLiquidity] = []
+    idx = tf_df.index
+
+    # ── Inducement ────────────────────────────────────────────────────────
+    if eng_type == "Inducement":
+        # After each swing break, look for a re-test inducement swing
+        for i in range(pivot_window * 2 + 2, n - 2):
+            atr_i  = tf_df["atr"].iloc[i]
+            w_high = tf_df["high"].iloc[i - pivot_window * 2: i].max()
+            w_low  = tf_df["low"].iloc[i - pivot_window * 2: i].min()
+
+            cl = tf_df["close"].iloc[i]
+            # Bullish BOS zone
+            if cl > w_high:
+                # Look for a lower high forming after BOS (inducement)
+                future_2 = tf_df.iloc[i + 1: i + 3]
+                if len(future_2) < 2:
+                    continue
+                induced_low = future_2["low"].min()
+                induced_ts  = future_2["low"].idxmin()
+                # Price then sweeps that induced low and reverses
+                if future_2["close"].iloc[-1] > cl * 0.9999:   # still bullish close
+                    signals.append(EngineeredLiquidity(
+                        timestamp   = idx[i],
+                        timeframe   = timeframe,
+                        eng_type    = "inducement",
+                        direction   = "bullish",
+                        trap_level  = induced_low,
+                        sweep_candle = induced_ts,
+                    ))
+            elif cl < w_low:
+                future_2 = tf_df.iloc[i + 1: i + 3]
+                if len(future_2) < 2:
+                    continue
+                induced_high = future_2["high"].max()
+                induced_ts   = future_2["high"].idxmax()
+                if future_2["close"].iloc[-1] < cl * 1.0001:
+                    signals.append(EngineeredLiquidity(
+                        timestamp   = idx[i],
+                        timeframe   = timeframe,
+                        eng_type    = "inducement",
+                        direction   = "bearish",
+                        trap_level  = induced_high,
+                        sweep_candle = induced_ts,
+                    ))
+
+    # ── False Break ───────────────────────────────────────────────────────
+    elif eng_type == "False break":
+        for i in range(pivot_window + 1, n - 1):
+            prior_high = tf_df["high"].iloc[i - pivot_window: i].max()
+            prior_low  = tf_df["low"].iloc[i - pivot_window: i].min()
+            row        = tf_df.iloc[i]
+            nxt        = tf_df.iloc[i + 1]
+            atr_i      = tf_df["atr"].iloc[i]
+
+            # Bearish false break: closes above, next closes back below
+            if (row["close"] > prior_high and
+                    nxt["close"] < prior_high and
+                    nxt["close"] < row["close"] - atr_i * 0.3):
+                signals.append(EngineeredLiquidity(
+                    timestamp   = nxt.name,
+                    timeframe   = timeframe,
+                    eng_type    = "false_break",
+                    direction   = "bearish",
+                    trap_level  = prior_high,
+                    sweep_candle = row.name,
+                ))
+
+            # Bullish false break: closes below, next closes back above
+            if (row["close"] < prior_low and
+                    nxt["close"] > prior_low and
+                    nxt["close"] > row["close"] + atr_i * 0.3):
+                signals.append(EngineeredLiquidity(
+                    timestamp   = nxt.name,
+                    timeframe   = timeframe,
+                    eng_type    = "false_break",
+                    direction   = "bullish",
+                    trap_level  = prior_low,
+                    sweep_candle = row.name,
+                ))
+
+    # ── Stop Hunt (Equal Highs / Equal Lows) ─────────────────────────────
+    elif eng_type == "Stop hunt":
+        atr_now = tf_df["atr"].mean()
+        tol     = eql_tolerance_mult * atr_now
+
+        eqh = _equal_levels(tf_df["high"], tol)
+        eql = _equal_levels(tf_df["low"],  tol)
+
+        for i in range(1, n):
+            row   = tf_df.iloc[i]
+            atr_i = tf_df["atr"].iloc[i]
+
+            for level in eqh:
+                if (row["high"] > level and
+                        row["close"] < level and
+                        row["high"] - level > atr_i * 0.1):
+                    signals.append(EngineeredLiquidity(
+                        timestamp    = idx[i],
+                        timeframe    = timeframe,
+                        eng_type     = "stop_hunt",
+                        direction    = "bearish",
+                        trap_level   = level,
+                        sweep_candle = idx[i],
+                    ))
+                    break
+
+            for level in eql:
+                if (row["low"] < level and
+                        row["close"] > level and
+                        level - row["low"] > atr_i * 0.1):
+                    signals.append(EngineeredLiquidity(
+                        timestamp    = idx[i],
+                        timeframe    = timeframe,
+                        eng_type     = "stop_hunt",
+                        direction    = "bullish",
+                        trap_level   = level,
+                        sweep_candle = idx[i],
+                    ))
+                    break
+
+    return signals
 
 
-def get_most_recent_sweep(
-    sweeps:    List[LiquiditySweep],
-    bar_index: int,
-    lookback:  int = 10,
-    direction: Optional[str] = None,
-) -> Optional[LiquiditySweep]:
-    """Return the most recent sweep within lookback bars."""
-    candidates = get_sweeps_at_bar(sweeps, bar_index, lookback, direction)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda s: s.bar_index)
-
-
-# ---------------------------------------------------------------------------
-# Self-test
-# ---------------------------------------------------------------------------
+# ── self-test ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, ".")
-    from swing_detector import detect_swings
+    import random
+    random.seed(21)
+    n   = 3000
+    idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+    close = 1.0800
+    rows  = []
+    for i in range(n):
+        close += random.gauss(0.0001, 0.0009)
+        o = close - abs(random.gauss(0, 0.0003))
+        h = max(o, close) + abs(random.gauss(0, 0.0005))
+        l = min(o, close) - abs(random.gauss(0, 0.0005))
+        rows.append({"open": o, "high": h, "low": l,
+                     "close": close, "volume": random.randint(100, 2000)})
+    df = pd.DataFrame(rows, index=idx)
 
-    print("=" * 60)
-    print("liquidity_detector.py — self test")
-    print("=" * 60)
-
-    N = 100
-    ts_base = 1_700_000_000_000
-
-    opens  = [1.0] * N
-    highs  = [1.01] * N
-    lows   = [0.99] * N
-    closes = [1.005] * N
-
-    # Phase 1: build swing high at bar ~10 (price ~1.05)
-    for i in range(0, 20):
-        v = 1.0 + (10 - abs(i - 10)) * 0.005
-        opens[i]  = v - 0.001
-        highs[i]  = v + 0.002
-        lows[i]   = v - 0.002
-        closes[i] = v
-
-    # Phase 2: pullback
-    for i in range(20, 35):
-        v = 1.05 - (i - 20) * 0.003
-        opens[i]  = v + 0.001
-        highs[i]  = v + 0.002
-        lows[i]   = v - 0.001
-        closes[i] = v
-
-    # Phase 3: sweep ABOVE the prior swing high (bar 10 high ~1.05)
-    # Bar 40: wicks above 1.05, but CLOSES back below → buy-side sweep
-    opens[40]  = 1.04
-    highs[40]  = 1.062   # sweeps above 1.05
-    lows[40]   = 1.038
-    closes[40] = 1.039   # closes back below swept high → bearish sweep signal
-
-    # Phase 4: price drops (confirming the bearish sweep)
-    for i in range(41, 60):
-        v = 1.039 - (i - 41) * 0.003
-        opens[i]  = v + 0.001
-        highs[i]  = v + 0.002
-        lows[i]   = v - 0.002
-        closes[i] = v - 0.001
-
-    # Phase 5: build swing low at bar ~65 (~0.92)
-    for i in range(60, 75):
-        v = 0.96 - abs(i - 67) * 0.005
-        opens[i]  = v + 0.001
-        highs[i]  = v + 0.003
-        lows[i]   = v - 0.002
-        closes[i] = v
-
-    # Phase 6: sweep BELOW the prior swing low
-    opens[80]  = 0.955
-    lows[80]   = 0.903    # sweeps below prior low (~0.925)
-    highs[80]  = 0.960
-    closes[80] = 0.958    # closes back above → bullish sweep signal
-
-    for i in range(81, N):
-        v = 0.958 + (i - 81) * 0.003
-        opens[i]  = v
-        highs[i]  = v + 0.002
-        lows[i]   = v - 0.001
-        closes[i] = v + 0.001
-
-    ts_arr = [ts_base + i * 3_600_000 for i in range(N)]
-
-    swings = detect_swings(highs, lows, ts_arr, method="rolling", length=10)
-    sweeps = detect_sweeps(opens, highs, lows, closes, ts_arr, swings)
-
-    print(f"\nSwings detected: {len(swings)}")
-    print(f"Sweeps detected: {len(sweeps)}")
-    for s in sweeps:
-        print(f"  {s}")
-
-    bullish = [s for s in sweeps if s.direction == "BULLISH"]
-    bearish = [s for s in sweeps if s.direction == "BEARISH"]
-    print(f"\n  Bullish sweeps (sell-side grabbed): {len(bullish)}")
-    print(f"  Bearish sweeps (buy-side grabbed):  {len(bearish)}")
-
-    recent = get_sweeps_at_bar(sweeps, 85, lookback=10)
-    print(f"\nSweeps within 10 bars of bar 85: {len(recent)}")
-
-    print("\n✅ liquidity_detector self-test complete")
+    for tf in ("15m", "1H"):
+        sw  = detect_liquidity_sweeps(df, tf, "Both")
+        eng = detect_engineered_liquidity(df, tf, "Stop hunt")
+        print(f"[{tf}] Sweeps={len(sw)}  Engineered={len(eng)}")
